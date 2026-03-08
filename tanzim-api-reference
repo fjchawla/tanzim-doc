@@ -1,0 +1,2233 @@
+= Tanzim Taxi Dispatch Platform — API Reference
+Tanzim Engineering Team <gov-relations@tanzim.io>
+v1.0.0, {docdate}
+:doctype: book
+:toc: left
+:toc-title: Contents
+:toclevels: 3
+:sectnums:
+:sectnumlevels: 3
+:icons: font
+:source-highlighter: rouge
+:rouge-style: github
+:experimental:
+:table-caption: Table
+:figure-caption: Figure
+:imagesdir: images
+:hardbreaks-option:
+
+// Metadata
+:product-name: Tanzim Taxi Dispatch Platform
+:api-version: 1.0.0
+:contact-email: gov-relations@tanzim.io
+:website: https://tanzim.io
+
+// Status admonition styles
+:tip-caption: 💡 Tip
+:note-caption: 📌 Note
+:warning-caption: ⚠️ Warning
+:caution-caption: 🚨 Caution
+:important-caption: ❗ Important
+
+<<<
+
+[abstract]
+== About This Document
+
+This reference covers the four core REST APIs that power the **{product-name}**: Trip Management, Driver & Vehicle Management, Real-Time Telemetry, and Fare Pricing. Together they orchestrate the complete lifecycle of a taxi dispatch operation — from a passenger booking a ride through to fare settlement, driver shift management, and fleet compliance.
+
+The platform is built on an event-driven microservice architecture. Each API runs as an independent service. Domain events propagate automatically across services as trips move through their lifecycle states — no manual cross-service calls are required from client applications.
+
+[cols="1,2,1,1", options="header"]
+|===
+| Service | Responsibility | Port | Base Path
+
+| Trip Service
+| Trip booking, lifecycle, scheduling
+| 10005
+| `/api/v1/trips`
+
+| Driver Service
+| Driver profiles, shifts, vehicles, ratings, compliance
+| 10001
+| `/api/v1/drivers`, `/api/v1/shifts`, `/api/v1/vehicles`
+
+| Telemetry Service
+| Real-time GPS ingestion and geospatial driver discovery
+| 10002
+| `/api/v1/locations`
+
+| Pricing Service
+| Fare estimation, zone pricing, toll gates, time windows
+| 10003
+| `/api/v1/pricing`
+|===
+
+<<<
+
+== Authentication
+
+All endpoints (except health checks) require a valid JWT bearer token issued by the Tanzim identity provider (Keycloak).
+
+[source,http]
+----
+Authorization: Bearer <your-jwt-token>
+----
+
+Tokens are obtained via the Driver Authentication endpoint. Access tokens expire and must be refreshed using the refresh token endpoint before expiry.
+
+.Security scheme
+[cols="1,2", options="header"]
+|===
+| Property | Value
+| Scheme | HTTP Bearer
+| Format | JWT (RS256)
+| Header | `Authorization`
+|===
+
+<<<
+
+== Standard Conventions
+
+=== Pagination
+
+All list endpoints that may return large result sets support cursor-free offset pagination via standard Spring parameters.
+
+[cols="1,1,3", options="header"]
+|===
+| Parameter | Default | Description
+| `page` | 0 | Zero-indexed page number
+| `size` | 20 | Records per page (max 100)
+| `sort` | varies | Field and direction, e.g. `createdAt,desc`
+|===
+
+=== Error Responses
+
+All APIs return errors in a unified envelope:
+
+[source,json]
+----
+{
+  "timestamp": "2024-06-01T14:30:00",
+  "status": 400,
+  "error": "Bad Request",
+  "message": "License plate 'ABC-1234' is already registered to another vehicle",
+  "path": "/api/v1/vehicles"
+}
+----
+
+[cols="1,3", options="header"]
+|===
+| HTTP Status | Meaning in Tanzim context
+| 200 | Request processed successfully
+| 201 | Resource created (driver, vehicle, trip, zone, etc.)
+| 204 | Deleted or deregistered — no response body
+| 400 | Validation failure or business rule violation
+| 401 | Missing or expired JWT token
+| 403 | Token present but insufficient permissions (e.g. driver updating another driver's location)
+| 404 | Resource not found (driver, trip, zone, etc.)
+| 409 | Conflict — duplicate license plate, active shift already exists, etc.
+| 429 | Rate limit exceeded (100 req/min per authenticated user)
+| 503 | Downstream service unavailable (e.g. telemetry service unreachable)
+|===
+
+=== Rate Limiting
+
+[cols="1,2", options="header"]
+|===
+| Context | Limit
+| Authenticated requests | 100 requests per minute
+| Unauthenticated requests | 20 requests per minute
+|===
+
+<<<
+
+== Trip Management API
+
+*Base URL:* `http://localhost:10005`
+
+The Trip API is the central orchestrator of the Tanzim dispatch lifecycle. Every ride on the platform — whether booked immediately, scheduled in advance, or set up as a recurring daily commute — originates here. The service accepts booking requests from passenger apps, coordinates driver search and assignment through the Telemetry Service, tracks each trip through its progression from request to completion, submits the actual route to the Pricing Service for final fare calculation, and signals downstream services to trigger payment processing and driver performance updates.
+
+The Trip Service does not communicate directly with drivers or passengers — it publishes domain events at every state transition, and the notification, telemetry, pricing, and driver services react to those events independently. This means a single `/complete` call ripples automatically into a fare calculation, a payment charge, a push notification to both parties, and an update to the driver's behavioral score — all without the client needing to orchestrate any of it.
+
+Trip data is the primary audit record for regulatory compliance. Every state transition is timestamped and immutable. Cancellation reasons, passenger instructions, and route coordinates are all retained for dispute resolution and government reporting purposes.
+
+=== Trip Lifecycle
+
+A trip moves through the following states from request to completion. Each transition is server-controlled — clients advance the trip by calling the appropriate lifecycle endpoint, but the platform validates that the current state permits the requested transition and rejects invalid jumps.
+
+[source]
+----
+REQUESTED → PENDING → CONFIRMED → DRIVER_ASSIGNED
+    → DRIVER_ARRIVED → IN_PROGRESS → PAYMENT_PENDING
+    → COMPLETED
+
+(pre-booking path) → SCHEDULED → CONFIRMED → DRIVER_ASSIGNED → ...
+
+(terminal states) → CANCELLED | FAILED | EXPIRED
+----
+
+[cols="1,3", options="header"]
+|===
+| State | What it means and what happens next
+
+| `REQUESTED`
+| The passenger's booking request has been received and validated. The platform begins searching for an eligible driver in the vicinity of the pickup point.
+
+| `PENDING`
+| Driver search is actively underway. The dispatch engine is querying the Telemetry Service for nearby available drivers and ranking candidates. If no driver accepts within the timeout window, the trip transitions to `EXPIRED`.
+
+| `CONFIRMED`
+| The system has confirmed the booking is dispatchable (a driver candidate has been identified or the scheduled time is locked). For scheduled trips, the trip remains in this state until dispatch time approaches.
+
+| `SCHEDULED`
+| The trip has been pre-booked for a future date/time. No driver assignment occurs until the scheduled window opens. The trip will automatically re-enter the `PENDING` → `CONFIRMED` flow at dispatch time.
+
+| `PROCESSING`
+| The driver assignment process is executing — the platform is sending the trip offer to the candidate driver and awaiting acceptance.
+
+| `DRIVER_ASSIGNED`
+| A driver has accepted the trip. Their details are visible to the passenger. The driver is en route to the pickup location. The passenger app can now display the driver's live position from the Telemetry Service.
+
+| `DRIVER_ARRIVED`
+| The driver has reached the pickup location and is waiting for the passenger. The pre-trip chat window (if enabled) is active. This state has a waiting timeout — if the passenger does not board within the permitted window, the driver may cancel.
+
+| `IN_PROGRESS`
+| The passenger has boarded and the trip is underway. The Telemetry Service is recording the route. The fare meter is running — actual distance and time are accumulating.
+
+| `PAYMENT_PENDING`
+| The driver has marked the trip complete. The actual route coordinates have been submitted to the Pricing Service for final fare calculation. The platform is processing the payment charge.
+
+| `COMPLETED`
+| Payment has settled successfully. The trip is closed. Both driver and passenger can now submit ratings. The driver's behavioral score is updated.
+
+| `CANCELLED`
+| The trip was cancelled by the passenger, the driver, or the platform before completion. The reason code and timestamp are recorded. Cancellation penalties may apply depending on when in the lifecycle the cancellation occurred.
+
+| `FAILED`
+| An unrecoverable error occurred — typically a payment failure that could not be resolved. The trip record is retained for support investigation.
+
+| `EXPIRED`
+| No driver accepted the trip request within the platform's dispatch timeout window. The passenger should retry the booking.
+|===
+
+NOTE: Clients must never attempt to transition a trip by directly setting the `status` field. Status is read-only in all request payloads — it is managed exclusively by server-side business logic and event handlers. Attempts to supply a `status` value in a request body are silently ignored.
+
+=== Vehicle Types
+
+Tanzim supports the following vehicle categories. Vehicle type determines which pricing rules, surge zones, and driver assignments apply.
+
+[cols="1,3", options="header"]
+|===
+| Value | Description
+| `SEDAN` | Standard 4-door saloon — the default option for most trips
+| `SUV` | Larger cabin, suitable for groups or extra luggage
+| `VAN` | 7–9 passenger capacity for group rides or transfers
+| `LUXURY` | Premium vehicles for corporate or high-end bookings
+| `ECONOMY` | Budget-tier option with reduced per-km rate
+| `ELECTRIC` | Zero-emission vehicles — available in supported areas
+| `HYBRID` | Fuel-efficient hybrid vehicles
+| `WOMEN` | Female driver, female passenger — gender-exclusive service
+| `AIRPORT` | Dedicated airport transfer service with fixed handling
+|===
+
+=== Payment Methods
+
+[cols="1,3", options="header"]
+|===
+| Value | Description
+| `CASH` | Driver collects cash directly from passenger at trip end
+| `CARD` | Card on file charged automatically at completion
+| `WALLET` | Deducted from the passenger's in-app Tanzim wallet
+| `APP` | Processed in-app via integrated payment gateway
+|===
+
+=== Endpoints
+
+==== Book a Trip
+
+`POST /api/v1/trips`
+
+Books a new ride request on behalf of a passenger. This is the entry point for all trip types on the platform. The behaviour after submission depends on the `bookingType` field:
+
+- **IMMEDIATE** (default): The platform begins driver search and dispatch immediately. The trip enters `REQUESTED` → `PENDING` within seconds of the call returning.
+- **SCHEDULED**: The booking is confirmed and held in `SCHEDULED` state. The platform will automatically begin driver search in the window leading up to `scheduledTime`. The `scheduledTime` field is required for this booking type.
+- **RECURRING**: Behaves like a scheduled trip but generates a new trip instance on each recurrence date according to `recurrencePattern` until `recurrenceEndDate` is reached. The `isRecurring` flag must be `true` and a pattern must be provided.
+
+The fare displayed to the passenger at booking time is an *estimate* sourced from the Pricing Service at the moment of booking. It reflects the current zone rates, active time window, and any surge in effect. The actual fare is calculated at trip completion using the real path driven.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Minimum coordinates precision | Latitude and longitude must be supplied to at least 4 decimal places for accurate driver dispatch and route calculation
+| Preferred driver | If `preferredDriverId` is supplied but that driver is unavailable or ineligible, the platform falls back to the nearest available qualified driver without error — the preference is best-effort only
+| Scheduled time | Must be at least 15 minutes in the future. Requests with a `scheduledTime` in the past or within the next 15 minutes are rejected with `400`
+| Recurring end date | `recurrenceEndDate` must be after `scheduledTime`. Recurring trips without an end date are rejected
+| Wallet balance | If `paymentMethod` is `WALLET`, the passenger must have sufficient balance at booking time or the request is rejected with `400`
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Missing required field (`userId`, coordinates, `vehicleType`, or `paymentMethod`) | Supply all required fields
+| 400 | `scheduledTime` is in the past or less than 15 minutes from now | Use a future time at least 15 minutes ahead
+| 400 | `recurrencePattern` is `CUSTOM` but `recurrenceDays` is empty | Supply at least one day in `recurrenceDays`
+| 400 | Passenger wallet balance insufficient for estimated fare | Passenger must top up wallet before booking
+| 404 | `userId` does not correspond to a known passenger account | Verify the user ID
+| 503 | Pricing Service unreachable — fare estimate could not be generated | Retry; the Pricing Service may be temporarily unavailable
+|===
+
+.Required fields
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `userId` | integer | The passenger's account ID
+| `sourceLatitude` | number | Pickup point latitude (-90 to 90)
+| `sourceLongitude` | number | Pickup point longitude (-180 to 180)
+| `destinationLatitude` | number | Drop-off point latitude
+| `destinationLongitude` | number | Drop-off point longitude
+| `vehicleType` | enum | One of the supported vehicle categories
+| `paymentMethod` | enum | How the fare will be collected
+|===
+
+.Optional fields
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `sourceAddress` | string | Human-readable pickup address (for display)
+| `destinationAddress` | string | Human-readable destination address
+| `bookingType` | enum | `IMMEDIATE` (default), `SCHEDULED`, or `RECURRING`
+| `scheduledTime` | datetime | Required when `bookingType` is `SCHEDULED`
+| `preferredDriverId` | integer | Request a specific driver (subject to availability)
+| `isRecurring` | boolean | Mark trip as part of a recurring schedule
+| `recurrencePattern` | enum | `DAILY`, `WEEKLY`, `WEEKDAYS`, `WEEKENDS`, `MONTHLY`, `CUSTOM`
+| `recurrenceDays` | array | Days of week for custom recurrence
+| `recurrenceEndDate` | datetime | When the recurring schedule expires
+| `specialInstructions` | string | Free-text instructions for the driver
+|===
+
+.Example request — immediate economy trip
+[source,json]
+----
+{
+  "userId": 4821,
+  "sourceLatitude": 25.2048,
+  "sourceLongitude": 55.2708,
+  "sourceAddress": "Dubai Mall, Financial Centre Road",
+  "destinationLatitude": 25.1972,
+  "destinationLongitude": 55.2796,
+  "destinationAddress": "Dubai International Airport, Terminal 3",
+  "vehicleType": "ECONOMY",
+  "paymentMethod": "WALLET",
+  "bookingType": "IMMEDIATE",
+  "specialInstructions": "Please wait at Gate 3"
+}
+----
+
+.Example request — scheduled weekly recurring trip
+[source,json]
+----
+{
+  "userId": 4821,
+  "sourceLatitude": 25.2048,
+  "sourceLongitude": 55.2708,
+  "destinationLatitude": 25.1972,
+  "destinationLongitude": 55.2796,
+  "vehicleType": "SEDAN",
+  "paymentMethod": "CARD",
+  "bookingType": "RECURRING",
+  "isRecurring": true,
+  "recurrencePattern": "WEEKDAYS",
+  "scheduledTime": "2024-07-01T07:30:00",
+  "recurrenceEndDate": "2024-12-31T23:59:59"
+}
+----
+
+Responds `200 OK` with a `TripResponseDTO` containing the assigned trip ID and initial status.
+
+==== Start a Trip
+
+`POST /api/v1/trips/{tripId}/start`
+
+Called by the driver's app when the passenger has boarded and the trip is physically underway. This is a critical lifecycle gate — the platform validates that the trip is in `DRIVER_ARRIVED` state before allowing the start. Transitioning to `IN_PROGRESS` activates route recording in the Telemetry Service: from this point forward, every GPS coordinate the driver app submits is associated with this trip and used for post-trip fare calculation.
+
+The start timestamp is recorded as the official trip start time and is used in driver behavioral metrics (on-time rate), fare time components, and compliance reporting.
+
+NOTE: If a pre-trip chat session was open between the driver and passenger, it is automatically closed when the trip starts. No further messages can be sent during the trip.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Required prior state | Trip must be in `DRIVER_ARRIVED` state. Attempting to start a trip in any other state (e.g. `DRIVER_ASSIGNED`) returns `400`
+| Driver identity | The JWT token must belong to the driver assigned to this trip. A different driver cannot start someone else's trip — this returns `403`
+| Idempotency | Calling `/start` on a trip already in `IN_PROGRESS` returns the current trip state without error
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Trip is not in `DRIVER_ARRIVED` state | Check trip status before calling; the driver must arrive at pickup first
+| 403 | Authenticated driver is not the assigned driver for this trip | Confirm the correct driver is logged in
+| 404 | Trip ID does not exist | Verify the trip ID
+|===
+
+==== Complete a Trip
+
+`POST /api/v1/trips/{tripId}/complete`
+
+Signals that the driver has delivered the passenger to the destination and the journey is over. This endpoint does more than change a status field — it submits the actual GPS path driven to the Pricing Service for final fare computation and triggers the payment collection sequence.
+
+The `actualPath` parameter is an ordered array of `[latitude, longitude]` coordinate pairs representing the exact route driven. The Pricing Service uses this path to: measure the true distance (which may differ from the estimated route due to traffic diversions or driver decisions), detect any toll gates the vehicle passed through, and apply any zone-based rate adjustments for the areas covered.
+
+The trip transitions to `PAYMENT_PENDING` immediately and then to `COMPLETED` once payment clears. If payment fails, the trip moves to `FAILED` and the support team is notified.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Required prior state | Trip must be in `IN_PROGRESS`. Completing a trip that has not started returns `400`
+| actualPath requirement | At minimum, the start (pickup) and end (drop-off) coordinates must be included. A path with fewer than 2 coordinate pairs is rejected
+| Fare comparison | If the actual fare deviates more than 20% above the original estimate, the platform flags the trip for review before charging. The passenger is notified of the variance
+| Driver identity | Only the assigned driver can complete the trip
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Trip is not in `IN_PROGRESS` state | Verify trip is actively underway before completing
+| 400 | `actualPath` contains fewer than 2 coordinate pairs | Submit the full GPS trace from the trip
+| 403 | Authenticated user is not the assigned driver | Verify driver identity
+| 404 | Trip ID not found | Confirm the trip ID
+| 503 | Pricing Service unavailable — fare cannot be calculated | Retry; the trip will remain in `IN_PROGRESS` until pricing resolves
+|===
+
+==== Cancel a Trip
+
+`POST /api/v1/trips/{tripId}/cancel`
+
+Cancels an active trip at any point before `COMPLETED`. Can be initiated by the passenger, the driver, or the platform itself (e.g. dispatch timeout, safety intervention). The reason code and optional comments are permanently recorded against the trip for compliance, dispute resolution, and driver behavioral scoring.
+
+Cancellation timing affects driver penalties: cancellations after `DRIVER_ASSIGNED` count against the driver's cancellation rate in behavioral scoring. Cancellations by the platform (e.g. expired, failed) are excluded from driver metrics.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Cancellable states | A trip can be cancelled from any state except `COMPLETED`, `CANCELLED`, or `FAILED`. Attempting to cancel a completed trip returns `400`
+| Reason code required | The `reason` query parameter is mandatory. Calls without a reason are rejected with `400`
+| Driver cancellation rate | If the cancelling party is the driver and the trip was in `DRIVER_ASSIGNED` or later state, this cancellation is recorded in the driver's behavioral score
+| Passenger no-show | When reason is `NO_SHOW` and the trip was in `DRIVER_ARRIVED` state, the driver may be eligible for a waiting time fee depending on operator policy
+| Refunds | Cancellations before `DRIVER_ASSIGNED` receive a full refund. Post-assignment cancellations may be subject to a cancellation fee per operator configuration
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | `reason` parameter is missing | Always supply a cancellation reason
+| 400 | Trip is already `COMPLETED`, `CANCELLED`, or `FAILED` | Cannot cancel a terminal-state trip
+| 403 | Caller is not the assigned driver, the booking passenger, or an admin | Verify identity and permissions
+| 404 | Trip ID not found | Confirm the trip ID
+|===
+
+==== Get Trip Details
+
+`GET /api/v1/trips/{tripId}`
+
+Returns the full current state of a trip at the moment of the call. This is the canonical source of truth for a trip's status, fare data, assignment details, and scheduling configuration. Both driver and passenger apps poll this endpoint to refresh trip state, though real-time status changes are also pushed via the notification service to reduce polling frequency.
+
+The response includes both `estimatedFare` (computed at booking time) and `actualFare` (computed at completion). Before the trip completes, `actualFare` will be null. After completion, both values are present for fare comparison and dispute resolution.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 404 | No trip exists with the given ID | Verify the trip ID; trips are not deleted, so a 404 is definitive
+| 403 | Caller is not the passenger, assigned driver, or admin | Verify authentication and permissions
+|===
+
+==== Get Passenger Trip History
+
+`GET /api/v1/trips/user/{userId}`
+
+Returns all trips ever associated with a passenger account — completed, cancelled, scheduled, and in-progress — ordered newest first. The response is not paginated; for passengers with very large trip histories, clients should consider filtering by date range on the client side.
+
+This endpoint is used to build trip history screens in the passenger app, generate user-level audit trails for support investigations, and produce ridership reports for regulatory submissions.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 404 | No user account found for the given ID | Verify the user ID against the identity service
+| 403 | Caller does not have permission to view this user's trips | Admin or the account owner only
+|===
+
+=== Trip Response Fields
+
+The `TripResponseDTO` is returned by all trip lifecycle endpoints. Fields that are not yet populated for the current state will be `null` rather than absent.
+
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `id` | integer | Unique trip identifier assigned at creation. Immutable for the lifetime of the trip
+| `userId` | integer | Passenger account ID. Identifies who booked the trip
+| `driverId` | integer | The driver assigned to this trip. `null` until a driver accepts the dispatch offer. Set to the accepting driver's ID at `DRIVER_ASSIGNED` state
+| `status` | enum | Current lifecycle state. Always reflects the server's authoritative state — do not cache or assume state on the client
+| `sourceLatitude` | number | Pickup point latitude as submitted at booking time
+| `sourceLongitude` | number | Pickup point longitude as submitted at booking time
+| `sourceAddress` | string | Human-readable pickup address if provided at booking. May be `null` if only coordinates were supplied
+| `destinationLatitude` | number | Drop-off point latitude
+| `destinationLongitude` | number | Drop-off point longitude
+| `destinationAddress` | string | Human-readable destination address if provided
+| `vehicleType` | enum | Vehicle category requested at booking time
+| `paymentMethod` | enum | How this trip's fare will be collected
+| `paymentStatus` | enum | Current payment state. `PENDING` during the trip, `PROCESSING` after completion, `COMPLETED` once charged, `FAILED` if payment could not be collected, `REFUNDED` if a cancellation refund was issued
+| `estimatedFare` | number | The fare estimate generated at booking time. Reflects zone rates, time window, and surge at the moment the trip was booked. This value does not change after booking
+| `actualFare` | number | The fare calculated after trip completion using the actual route driven. `null` until the trip reaches `PAYMENT_PENDING`. May differ from `estimatedFare` due to route deviations, actual travel time, or toll gates encountered
+| `isScheduled` | boolean | `true` for trips that were pre-booked with a `scheduledTime`. `false` for immediate trips
+| `scheduledTime` | datetime | The requested departure time for scheduled trips. `null` for immediate bookings
+| `isRecurring` | boolean | `true` if this trip is one instance in a recurring series
+| `requestedAt` | datetime | ISO-8601 timestamp of when the booking request was received by the platform
+| `completedAt` | datetime | ISO-8601 timestamp of when the trip reached `COMPLETED` state. `null` for in-progress or cancelled trips
+|===
+
+<<<
+
+== Driver & Vehicle Management API
+
+*Base URL:* `http://localhost:10001`
+
+The Driver & Vehicle API is the authoritative registry for every human and machine that operates on the Tanzim network. It is a multi-domain service — rather than a single narrow responsibility, it owns the full scope of fleet governance: who is allowed to drive, which vehicle they operate, when they are working, how passengers have rated them, and whether their conduct meets the platform's safety and compliance standards.
+
+This service is designed to serve three distinct consumer groups simultaneously. **Driver apps** use it for authentication, shift management, location updates, and viewing their own performance data. **Passenger apps** use it indirectly — the dispatch engine queries driver availability and proximity data here before assigning a trip. **Fleet operators and compliance teams** use the administrative endpoints for driver onboarding, licence monitoring, suspension management, and regulatory reporting.
+
+The service integrates with Keycloak for identity management. Every driver registration provisions a Keycloak account, and all driver-facing JWT tokens are issued and validated through that identity provider. The Driver Service holds the Tanzim-specific profile data (operator assignment, licence details, vehicle assignment, behavioral scores) while Keycloak holds the authentication credentials.
+
+Driver conduct is governed through three layered systems that feed into each other: the **shift system** tracks working hours and break compliance; the **rating system** captures passenger-reported service quality; and the **behavioral scoring system** synthesises telemetry data (speeding, harsh braking, phone use) with operational metrics (cancellation rate, acceptance rate, on-time pickups) into a single composite score. Together these systems give fleet managers and compliance officers a 360-degree view of every driver on the network.
+
+=== Driver Operators
+
+Tanzim operates across multiple licensed taxi operators. Each driver belongs to exactly one operator.
+
+[cols="1,2", options="header"]
+|===
+| Value | Operator
+| `NATIONAL_TAXI` | National Taxi Company
+| `KABI` | Kabi Ride Services
+| `METRO_TAXI` | Metro Taxi
+| `DTC` | Dubai Taxi Corporation
+| `ARABIA_TAXI` | Arabia Taxi
+|===
+
+=== Driver Status Values
+
+[cols="1,3", options="header"]
+|===
+| Status | Meaning
+| `PENDING` | Driver registered but not yet approved to operate
+| `ACTIVE` | Approved and able to accept trips when available
+| `INACTIVE` | Temporarily not operating (e.g. voluntary leave)
+| `SUSPENDED` | Temporarily barred from accepting trips pending investigation
+| `BLOCKED` | Blocked from the platform — cannot log in or take rides
+| `DEACTIVATED` | Permanently removed from the network
+|===
+
+=== Driver Management Endpoints
+
+==== Register a New Driver
+
+`POST /api/v1/drivers`
+
+Registers a new driver on the Tanzim platform. This is a two-step internal operation: first the driver profile is persisted in the Driver Service database, then a corresponding identity account is provisioned in Keycloak using the supplied email and password. Both operations must succeed — if Keycloak provisioning fails after the profile is written, the profile is rolled back and a `500` is returned.
+
+The driver begins in `PENDING` status and cannot go online, accept trips, or be assigned to vehicles until an administrator activates the account. This gate exists to ensure document verification, background checks, and operator onboarding steps are completed before the driver operates on the network.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Uniqueness | The combination of email address, phone number, and licence number must each be unique across the entire platform — not just within an operator. Duplicate values across any of these three fields are rejected with `409`
+| Phone format | Phone numbers must be in international format. UAE numbers follow the pattern `+971XXXXXXXXX`. Numbers without a country code are rejected with `400`
+| Licence expiry | If `licenseExpiryDate` is supplied and is already in the past, the driver is created in `PENDING` status but will be immediately flagged by the compliance system for licence renewal before activation
+| Operator assignment | Every driver must belong to exactly one operator. The `operator` field is immutable after registration — changes require a support workflow
+| Password policy | Passwords are passed through to Keycloak and must meet the configured Keycloak password policy (minimum 8 characters, at least one digit and one uppercase letter by default)
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Missing required field | Ensure all required fields are present and non-empty
+| 400 | Phone number does not match international format | Reformat to `+[country code][number]`
+| 400 | Password does not meet Keycloak policy requirements | Use a password with at least 8 characters including a digit and uppercase letter
+| 409 | Email address already registered | Each driver must have a unique email; check for duplicate registrations
+| 409 | Phone number already registered | Verify the phone number is not already associated with another account
+| 409 | Licence number already registered | A licence can only be registered once on the platform
+| 500 | Keycloak account provisioning failed | This is a platform-side issue; retry or contact infrastructure support
+|===
+
+==== Get Driver Profile
+
+`GET /api/v1/drivers/{driverId}`
+
+Returns the complete profile for a driver including current status, availability flag, operator, and account timestamps.
+
+==== Get Driver by Employee ID
+
+`GET /api/v1/drivers/employeeId/{employeeId}`
+
+Looks up a driver by the operator-assigned employee reference rather than the internal Tanzim driver ID. Useful for integrations with operator HR and payroll systems.
+
+==== Update Driver Profile
+
+`PUT /api/v1/drivers/{driverId}`
+
+Updates editable profile fields. Identity-sensitive fields (email, licence number) cannot be changed here — those require a compliance workflow. Updatable fields: `firstName`, `lastName`, `phone`, `profileImageUrl`, `licenseExpiryDate`.
+
+==== Delete Driver
+
+`DELETE /api/v1/drivers/{driverId}`
+
+Permanently removes a driver record. This is a hard delete — use with extreme caution and only when required by regulation. In most cases, deactivating the driver is the appropriate action.
+
+==== Activate a Driver
+
+`POST /api/v1/drivers/{driverId}/activate`
+
+Sets the driver's status to `ACTIVE`, making them eligible to accept trips once they go online. Typically called after a new driver's documents and background check have been verified.
+
+==== Suspend a Driver
+
+`POST /api/v1/drivers/{driverId}/suspend?reason={reason}`
+
+Temporarily suspends a driver. A suspended driver cannot go online or accept new trips. Existing active trips are not affected. Provide a reason for the compliance audit trail.
+
+==== Deactivate a Driver
+
+`POST /api/v1/drivers/{driverId}/deactivate?reason={reason}`
+
+Permanently deactivates the driver account. The account still exists for historical records and reporting, but the driver cannot be reactivated without administrative intervention.
+
+==== Set Driver Online
+
+`POST /api/v1/drivers/{driverId}/go-online`
+
+Marks the driver as available for dispatch. The driver's location must already be registered in the Telemetry Service before they will appear in driver discovery results.
+
+==== Set Driver Offline
+
+`POST /api/v1/drivers/{driverId}/go-offline`
+
+Marks the driver as unavailable. They stop appearing in dispatch searches. Any active trip is not affected.
+
+==== Update Driver Availability Flag
+
+`PUT /api/v1/drivers/{driverId}/availability`
+
+Fine-grained control over the driver's availability state without changing their online/offline status. Used when a driver is temporarily unable to accept rides mid-shift (e.g. fuelling, brief detour) without going fully offline.
+
+==== Update Driver Status (Admin)
+
+`PUT /api/v1/drivers/{driverId}/status`
+
+Direct administrative override of driver status. Accepts any valid status value with an optional reason. Used for bulk compliance operations and manual administrative corrections.
+
+==== Bulk Update Driver Status
+
+`PUT /api/v1/drivers/bulk/status?driverIds={ids}&newStatus={status}`
+
+Updates the status of multiple drivers in a single request. Used for mass operations such as suspending an entire operator's fleet pending an audit, or activating a batch of newly approved drivers.
+
+==== Update Driver Location (Full State)
+
+`POST /api/v1/drivers/{driverId}/location`
+
+Updates the driver's complete real-time state in the telemetry system. Call this when availability, current trip, bearing, speed, battery level, or other metadata changes — or as a periodic heartbeat every 20–60 seconds.
+
+NOTE: For high-frequency GPS pings (every 4–10 seconds) where only coordinates change, use the lightweight `POST /api/v1/drivers/{driverId}/coordinates` endpoint instead. This full-state endpoint should not be called at GPS ping frequency.
+
+.Request fields (`DriverLocation`)
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `latitude` | number | Current GPS latitude
+| `longitude` | number | Current GPS longitude
+| `bearing` | number | Direction of travel in degrees (0–360)
+| `speed` | number | Speed in km/h
+| `accuracy` | number | GPS accuracy radius in metres
+| `isAvailable` | boolean | Whether the driver is accepting new trips
+| `currentTripId` | integer | Active trip ID if the driver is on a trip
+| `vehicleId` | integer | Currently assigned vehicle
+| `batteryLevel` | integer | Device battery 0–100 (used for telemetry health monitoring)
+| `source` | string | Location source identifier (e.g. `GPS`, `NETWORK`)
+|===
+
+==== Quick Coordinates Update
+
+`POST /api/v1/drivers/{driverId}/coordinates?latitude={lat}&longitude={lon}`
+
+Lightweight endpoint for high-frequency position pings. Only updates the driver's GPS coordinates in the geospatial index. Does *not* update availability, trip status, speed, bearing, or battery level. Designed to be called every 4–10 seconds while the driver is active.
+
+.Response
+Returns `204 No Content` on success — intentionally no body to minimise bandwidth.
+
+==== Check Dispatch Eligibility
+
+`GET /api/v1/drivers/{driverId}/can-accept-ride`
+
+Returns a boolean indicating whether the driver is currently eligible to receive a trip assignment. The platform checks: status is `ACTIVE`, availability flag is true, licence is not expired, no active suspension or block.
+
+==== Find Nearest Available Driver
+
+`GET /api/v1/drivers/nearest?latitude={lat}&longitude={lon}`
+
+Returns the single nearest available driver to the given coordinates. Uses the live telemetry index. This is the primary endpoint used by the dispatch engine when assigning a trip.
+
+==== Discover Nearby Drivers
+
+`GET /api/v1/drivers/discover/nearby`
+
+Returns available drivers within a configurable radius. Passenger-facing apps use this to display the animated driver map before and during booking.
+
+.Query parameters
+[cols="1,1,1,3", options="header"]
+|===
+| Parameter | Type | Default | Description
+| `latitude` | number | — | Search centre latitude
+| `longitude` | number | — | Search centre longitude
+| `radiusKm` | number | 3.0 | Search radius in kilometres
+| `limit` | integer | none | Maximum results. When omitted, all drivers in radius are returned
+|===
+
+==== Get Available Drivers
+
+`GET /api/v1/drivers/available`
+
+Returns all drivers currently marked as available for dispatch. Used by the operations dashboard to understand fleet availability in real time.
+
+==== Get Qualified Available Drivers
+
+`GET /api/v1/drivers/available/qualified?minRating={rating}`
+
+Returns available drivers who meet a minimum rating threshold. Used when passengers request a quality-assured driver. Default threshold: 4.0 stars.
+
+==== Get Premium Eligible Drivers
+
+`GET /api/v1/drivers/available/premium?minRating={rating}&minTrips={trips}`
+
+Returns drivers eligible for premium vehicle types (`LUXURY`, `AIRPORT`). Premium qualification requires both a high sustained rating (default 4.5) and significant trip experience (default 50 completed trips).
+
+==== Get All Active Drivers
+
+`GET /api/v1/drivers/active`
+
+Returns all drivers with `ACTIVE` status, regardless of current availability or online state. Used for fleet management and compliance reporting.
+
+==== Get Drivers by Status
+
+`GET /api/v1/drivers/status/{status}`
+
+Returns all drivers in a specific status. Use for targeted administrative actions, e.g. reviewing all `SUSPENDED` drivers pending investigation.
+
+==== Get Top-Rated Drivers
+
+`GET /api/v1/drivers/top-rated?minRatings={n}&limit={n}`
+
+Returns the highest-rated drivers with a minimum number of qualifying ratings. Used for recognition programmes, premium service allocation, and operator incentive reporting.
+
+==== Get Drivers Needing Attention
+
+`GET /api/v1/drivers/needing-attention?minRating={r}&minRecentRating={r}`
+
+Returns drivers whose ratings have fallen below acceptable thresholds. Fleet managers use this to identify drivers who need coaching, additional training, or compliance review.
+
+==== Search Drivers
+
+`GET /api/v1/drivers/search?searchTerm={term}`
+
+Full-text search across driver first name, last name, email, phone, and licence number. Paginated. Used by operations staff to quickly locate a specific driver record.
+
+==== Driver Performance Summary
+
+`GET /api/v1/drivers/{driverId}/performance`
+
+Returns a concise performance scorecard: average rating, recent rating trend, behaviour score, acceptance rate, and completion rate. Designed for management dashboard tiles.
+
+==== Driver Compliance Report
+
+`GET /api/v1/drivers/{driverId}/compliance`
+
+Returns the driver's full compliance picture: licence expiry status, days remaining, any open compliance issues, and recommended remediation actions. Used for regulatory reporting and audit preparation.
+
+==== Driver Statistics (Fleet Overview)
+
+`GET /api/v1/drivers/statistics`
+
+Returns aggregate statistics across the entire fleet: total drivers by status, availability breakdown, and status distribution. Powers the operations command dashboard.
+
+==== Fleet Dashboard Summary
+
+`GET /api/v1/drivers/dashboard`
+
+Returns a high-level snapshot for the fleet management dashboard: total drivers, currently active, currently available, drivers needing attention, open safety alerts, compliance issues, and new registrations in the last 7 days.
+
+==== New Driver Registrations
+
+`GET /api/v1/drivers/new-registrations?daysThreshold={days}`
+
+Returns drivers who joined the platform within the specified number of days. Default window: 7 days. Used for onboarding tracking and operator reporting.
+
+==== Driver Registration Report
+
+`GET /api/v1/drivers/reports/registration?startDate={date}&endDate={date}`
+
+Returns a structured registration report for a date range: total registrations, how many were approved, how many are still pending, and the list of new driver profiles.
+
+<<<
+
+=== Shift Management Endpoints
+
+A driver shift represents a single bounded work period on the Tanzim network. Shifts enforce regulatory fatigue management rules: each shift runs for a maximum of 12 hours, within which the driver is entitled to a total of 90 minutes of rest breaks, with no individual break exceeding 15 minutes. These limits are enforced server-side — the platform will auto-cap overlong breaks and reject break requests once the allowance is exhausted.
+
+Shifts are the primary unit of record for payroll, regulatory hour submissions, and driver fatigue compliance. Every minute of a shift is classified as either **net driving time** (available for trips) or **break time** (rest). The shift report endpoint exposes both figures for each shift.
+
+The shift system is also coupled to behavioral scoring: a driver who violates break duration limits (recorded as a `BREAK_MAX_TIME_VIOLATED` event) accumulates a penalty against their compliance score. Shifts that end with an open break (driver forgot to end it) have the break automatically closed at shift-end time, and the excess is capped.
+
+==== Shift Business Rules
+
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Shift duration | Fixed at 12 hours. The shift end time is tracked but not auto-enforced — a shift that overruns 12 hours remains open until explicitly ended. Operations managers receive an alert when a shift exceeds its window
+| Maximum total break time | 90 minutes per shift. Once this threshold is reached, the `breakAllowanceExhausted` flag is set to `true` and no further breaks can be started for the remainder of the shift
+| Maximum single break duration | 15 minutes per break. If the driver ends a break after more than 15 minutes, the platform records the end time as `startTime + 15 minutes`. The actual clock time the driver spent on break does not extend the allowance beyond the cap
+| Concurrent breaks | Not permitted. If a driver attempts to start a break while one is already in progress, the request is rejected with `409`
+| Concurrent active shifts | A driver can only have one active shift at any time. Starting a shift while one is active returns `409`. Operators must end the previous shift before a new one can begin
+| Break during a trip | The platform does not prevent a driver from starting a break while they have an active trip — this is intentional, as the driver may need to pause for a brief stop. However, starting a break while `IN_PROGRESS` on a trip is recorded in the event log for compliance review
+| Auto-close on shift end | If the driver ends their shift while a break is still open, the break is automatically closed at the shift-end timestamp before the shift is finalised
+|===
+
+==== Start a Driver Shift
+
+`POST /api/v1/shifts/start`
+
+Opens a new 12-hour shift for a driver. The shift start timestamp is recorded at the moment the request is processed. Once started, the driver is eligible to go online and receive trip assignments for the duration of the shift.
+
+[source,json]
+----
+{ "driverId": 1042 }
+----
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | `driverId` is missing or invalid | Supply a valid driver ID
+| 404 | No driver found for the given ID | Verify the driver exists and is registered
+| 409 | Driver already has an active shift | End the existing shift before starting a new one
+|===
+
+==== End a Driver Shift
+
+`PATCH /api/v1/shifts/{shiftId}/end`
+
+Closes the shift and finalises all shift metrics. If the driver is on a break at the time this call is made, the open break is automatically closed at the same timestamp before the shift is marked complete. The shift's `netDrivingMinutes` and `totalBreakMinutesUsed` are locked at this point for payroll and reporting.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 404 | Shift ID not found | Verify the shift ID
+| 400 | Shift is already closed (not active) | A shift can only be ended once
+| 403 | Authenticated driver does not own this shift | Only the driver or an admin can end a shift
+|===
+
+==== Start a Break
+
+`POST /api/v1/shifts/{shiftId}/breaks/start`
+
+Begins a rest break within an active shift. The break start time is recorded at the moment of the call. An optional `reason` can be provided for operational records (e.g. "Fuel stop", "Prayer break", "Vehicle check"). Reason values are free-text and not validated against a controlled vocabulary.
+
+[source,json]
+----
+{ "reason": "Prayer break" }
+----
+
+The platform validates that: the shift is currently active; no break is already in progress; and the total break allowance for the shift has not been exhausted.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Shift is not active | Breaks can only be taken during an active shift
+| 409 | A break is already in progress for this shift | End the current break before starting another
+| 409 | Break allowance of 90 minutes is fully exhausted | No further breaks are permitted for this shift
+| 404 | Shift ID not found | Verify the shift ID
+|===
+
+==== End a Break
+
+`PATCH /api/v1/shifts/{shiftId}/breaks/end`
+
+Closes the current open break. The platform computes the break duration. If the break has run for more than 15 minutes, the recorded break end time is silently adjusted back to `breakStart + 15 minutes` — the driver's actual return time is not recorded beyond the cap. This prevents long unauthorised breaks from consuming disproportionate allowance from the 90-minute pool.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | No break is currently in progress for this shift | Cannot end a break that has not started
+| 400 | Shift is not active | Cannot manage breaks on a closed shift
+| 404 | Shift ID not found | Verify the shift ID
+|===
+
+==== Get Shift Details
+
+`GET /api/v1/shifts/{shiftId}`
+
+Returns the full shift state including elapsed time, break usage, remaining allowance, current break status, and a log of all breaks taken.
+
+==== Get Active Shift for Driver
+
+`GET /api/v1/shifts/driver/{driverId}/active`
+
+Returns the driver's currently active shift. Returns 404 if the driver has no active shift.
+
+==== Get All Active Shifts
+
+`GET /api/v1/shifts/active`
+
+Returns all currently active shifts across all drivers. Used by operations supervisors to monitor live fleet shift status.
+
+==== Get Driver Shift History
+
+`GET /api/v1/shifts/driver/{driverId}`
+
+Paginated list of all shifts for a driver, sorted newest first.
+
+==== Get Shifts by Date Range
+
+`GET /api/v1/shifts/driver/{driverId}/range?from={datetime}&to={datetime}`
+
+Returns all shifts for a driver that started within the specified date range. Used for payroll calculation and regulatory reporting.
+
+==== Get Shift Report
+
+`GET /api/v1/shifts/{shiftId}/report`
+
+Returns the full analytics report for a single shift:
+
+[cols="1,3", options="header"]
+|===
+| Field | Description
+| `shiftDurationMinutes` | Total elapsed time from shift start to end (or current time if active)
+| `netDrivingMinutes` | Shift duration minus all break time — the actual time available for trips
+| `totalBreaksTaken` | Number of breaks recorded in the shift
+| `totalBreakMinutesUsed` | Total break time consumed
+| `remainingBreakMinutes` | How much break allowance is still available
+| `breakAllowanceExhausted` | Whether the 90-minute cap has been hit
+| `maxAllowedBreakMinutes` | Always 90 — the platform maximum
+| `maxBreakDurationMinutes` | Always 15 — the per-break maximum
+| `breaks` | Full list of breaks with individual start, end, duration, and reason
+|===
+
+==== Get Shift Reports by Date Range
+
+`GET /api/v1/shifts/driver/{driverId}/report?from={datetime}&to={datetime}`
+
+Returns shift reports for all shifts within the date range. Used for payroll period reporting, regulatory submission, and fatigue compliance audits.
+
+<<<
+
+=== Vehicle Management Endpoints
+
+==== Vehicle Statuses
+
+[cols="1,3", options="header"]
+|===
+| Status | Description
+| `PENDING` | Vehicle submitted but not yet inspected and approved
+| `ACTIVE` | Cleared for dispatch — can be assigned to drivers
+| `INACTIVE` | Temporarily not in service
+| `MAINTENANCE` | Undergoing scheduled or unscheduled maintenance
+| `SUSPENDED` | Removed from service pending investigation
+| `RETIRED` | Permanently decommissioned from the fleet
+|===
+
+==== Register a Vehicle
+
+`POST /api/v1/vehicles`
+
+Registers a new vehicle in the Tanzim fleet. The vehicle starts in `PENDING` status and must be approved before it can be assigned to a driver.
+
+.Required fields
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `licensePlate` | string | Unique plate number (max 20 characters)
+| `make` | string | Manufacturer (e.g. Toyota, Nissan)
+| `model` | string | Model name (e.g. Camry, Patrol)
+| `year` | integer | Model year (1900–2100)
+| `vehicleType` | enum | Category (SEDAN, SUV, etc.)
+| `vehicleOperator` | enum | Which operator fleet this vehicle belongs to
+| `status` | enum | Initial status (typically PENDING)
+|===
+
+.Optional fields
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `vin` | string | Vehicle identification number (unique)
+| `color` | string | Vehicle colour
+| `capacity` | integer | Passenger capacity (minimum 1)
+| `registrationExpiry` | datetime | When the vehicle registration expires
+| `insuranceExpiry` | datetime | When the vehicle insurance expires
+| `lastInspectionDate` | datetime | Date of most recent safety inspection
+| `nextInspectionDate` | datetime | Scheduled next inspection date
+| `odometerReading` | integer | Current odometer in kilometres
+|===
+
+==== Get Vehicle Details
+
+`GET /api/v1/vehicles/{vehicleId}`
+
+Returns the full vehicle record including status, compliance dates, and assignment history.
+
+==== Get Vehicle by License Plate
+
+`GET /api/v1/vehicles/license-plate/{licensePlate}`
+
+Looks up a vehicle by its plate number. Used for roadside checks, driver app onboarding verification, and dispatch integration.
+
+==== Update Vehicle Record
+
+`PUT /api/v1/vehicles/{vehicleId}`
+
+Updates any mutable vehicle field. Use this to record odometer updates after a shift, update insurance or registration expiry after renewal, or correct make/model details.
+
+==== Update Vehicle Status
+
+`PATCH /api/v1/vehicles/{vehicleId}/status`
+
+Changes only the vehicle's operational status without modifying other fields. Use this for rapid status transitions: taking a vehicle offline for maintenance, suspending it during an investigation, or retiring it from the fleet.
+
+==== Delete Vehicle
+
+`DELETE /api/v1/vehicles/{vehicleId}`
+
+Permanently removes the vehicle record. Use only when a vehicle was registered in error. For vehicles leaving the fleet, use `RETIRED` status instead.
+
+==== List Vehicles
+
+`GET /api/v1/vehicles`
+
+Returns a paginated list of vehicles. Can be filtered by status and/or vehicle type.
+
+.Query parameters
+[cols="1,1,3", options="header"]
+|===
+| Parameter | Type | Description
+| `status` | enum | Filter by operational status
+| `vehicleType` | enum | Filter by vehicle category
+| `page` | integer | Page number (0-indexed)
+| `size` | integer | Results per page
+|===
+
+<<<
+
+=== Vehicle Assignment Endpoints
+
+Vehicle assignments link a driver to a specific vehicle for a defined period. A driver may only have one active assignment at a time.
+
+==== Assignment Types
+
+[cols="1,3", options="header"]
+|===
+| Type | Description
+| `PERMANENT` | Long-term fixed assignment — the driver always uses this vehicle
+| `TEMPORARY` | Short-term cover (e.g. while the driver's regular vehicle is in maintenance)
+| `SHIFT_BASED` | Assignment valid only for the duration of a specific shift
+| `RENTAL` | Vehicle is rented to the driver under a rental agreement
+|===
+
+==== Create Assignment
+
+`POST /api/v1/assignments`
+
+Assigns a vehicle to a driver. Records the odometer reading at the point of assignment for tracking vehicle usage per driver.
+
+==== Get Current Assignment
+
+`GET /api/v1/assignments/driver/{driverId}/current`
+
+Returns the driver's currently active vehicle assignment. Used at shift start to verify which vehicle the driver is operating.
+
+==== Get Assignment History
+
+`GET /api/v1/assignments/driver/{driverId}/history`
+
+Full history of all vehicle assignments for a driver. Useful for fleet audit trails and mileage attribution.
+
+==== Terminate Assignment
+
+`POST /api/v1/assignments/{assignmentId}/terminate`
+
+Ends an assignment before its scheduled end date. Records the final odometer reading and reason for early termination.
+
+==== Complete Expired Assignments
+
+`POST /api/v1/assignments/complete-expired`
+
+System maintenance endpoint that closes all assignments whose end date has passed but were not explicitly terminated. Returns the number of assignments closed.
+
+<<<
+
+=== Rating & Review Endpoints
+
+Ratings are submitted by passengers after trip completion. Each rating covers multiple service dimensions and contributes to the driver's overall score.
+
+==== Submit a Rating
+
+`POST /api/v1/ratings`
+
+Submits a passenger rating for a completed trip. All score fields are on a 1–5 scale.
+
+.Request fields
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `tripId` | integer | The completed trip being rated
+| `driverId` | integer | The driver who conducted the trip
+| `passengerId` | integer | The passenger submitting the rating
+| `overallRating` | number | Composite score (1.0–5.0)
+| `drivingQuality` | number | Smoothness, safety, and road awareness (1.0–5.0)
+| `professionalism` | number | Conduct, attire, and attitude (1.0–5.0)
+| `vehicleCleanliness` | number | Cabin cleanliness and hygiene (1.0–5.0)
+| `communication` | number | Responsiveness and clarity (1.0–5.0)
+| `punctuality` | number | Timeliness of arrival and departure (1.0–5.0)
+| `reviewText` | string | Optional free-text passenger review
+| `wouldRecommend` | boolean | Would the passenger recommend this driver?
+| `isAnonymous` | boolean | Hide the passenger's identity from the driver
+|===
+
+==== Get Rating for Trip
+
+`GET /api/v1/ratings/trip/{tripId}`
+
+Returns the rating submitted for a specific trip. Used for trip history screens and post-trip review flows.
+
+==== Get All Ratings for Driver
+
+`GET /api/v1/ratings/driver/{driverId}`
+
+Returns all ratings ever submitted for a driver. Paginated variant available at `/driver/{driverId}/paginated`.
+
+==== Rating Analytics
+
+`GET /api/v1/ratings/driver/{driverId}/analytics`
+
+Comprehensive rating analytics including overall average, per-category averages, star distribution breakdown, recommendation percentage, and flagged ratings count.
+
+==== Rating Trend
+
+`GET /api/v1/ratings/driver/{driverId}/trend?days={n}`
+
+Analyses the direction and magnitude of a driver's rating trend over the last N days (default 30). Returns `IMPROVING`, `DECLINING`, or `STABLE` with a trend value.
+
+==== Monthly Rating Report
+
+`GET /api/v1/ratings/driver/{driverId}/monthly`
+
+Month-by-month breakdown of a driver's rating count and average. Used for performance review cycles and operator incentive calculations.
+
+==== Performance Report
+
+`GET /api/v1/ratings/driver/{driverId}/performance-report?startDate={date}&endDate={date}`
+
+Structured performance report for a date range: total ratings, average score, recommendation count, low rating count, and identified strengths and weaknesses.
+
+==== Improvement Suggestions
+
+`GET /api/v1/ratings/driver/{driverId}/improvement-suggestions`
+
+AI-generated coaching recommendations based on the driver's weakest rating categories. Surfaced in the driver app as personalised tips and in the fleet management portal as coaching action items.
+
+==== Category Analysis
+
+`GET /api/v1/ratings/driver/{driverId}/categories`
+
+Per-category rating breakdown showing average score, performance tier, and percentage of the maximum score for each of the five rating dimensions.
+
+==== Benchmark Report
+
+`GET /api/v1/ratings/driver/{driverId}/benchmark`
+
+Compares the driver's rating against the platform-wide average. Returns the driver's percentile ranking and performance tier (e.g. "Top 10%", "Below Average").
+
+==== Compare Drivers
+
+`POST /api/v1/ratings/compare`
+
+Side-by-side comparison of ratings across multiple drivers. Accepts a list of driver IDs and returns their average ratings, total rating counts, recent averages, and recommendation percentages.
+
+==== Flag a Rating
+
+`POST /api/v1/ratings/{ratingId}/flag`
+
+Flags a rating as potentially inappropriate, spam, or retaliatory. Flagged ratings are queued for human review and excluded from the driver's score while under investigation.
+
+==== Unflag a Rating
+
+`POST /api/v1/ratings/{ratingId}/unflag`
+
+Clears a flag after review, reinstating the rating's contribution to the driver's score.
+
+==== Get Flagged Ratings
+
+`GET /api/v1/ratings/flagged`
+
+Returns all ratings currently flagged for review. Used by the moderation team to work through the review queue.
+
+==== Get Problematic Ratings
+
+`GET /api/v1/ratings/driver/{driverId}/problematic?threshold={score}`
+
+Returns ratings below the specified score threshold (default 3.0). Used to identify specific trips that caused passenger dissatisfaction and may warrant follow-up.
+
+<<<
+
+=== Behavior & Safety Endpoints
+
+The behavior and safety system ingests telemetry events from the driver app during trips, scores each event, and produces ongoing behavioral scores that inform dispatch eligibility, premium qualification, and compliance actions.
+
+==== Behavior Event Types
+
+*Negative events* (reduce score): `HARSH_ACCELERATION`, `HARSH_BRAKING`, `HARSH_CORNERING`, `SPEEDING`, `RAPID_LANE_CHANGE`, `SUDDEN_STOP`, `HARD_TURN`, `PHONE_USE_DETECTED`, `DISTRACTED_DRIVING`, `TAILGATING`
+
+*Positive events* (improve score): `SAFE_DRIVING`, `SMOOTH_ACCELERATION`, `SMOOTH_BRAKING`, `MAINTAINED_SAFE_DISTANCE`, `FOLLOWED_SPEED_LIMIT`
+
+==== Record Behavior Event
+
+`POST /api/v1/behavior/events`
+
+Records a single telemetry-derived behavior event from the driver app. Events are collected in real time during trips and processed in batch to update behavioral scores.
+
+==== Process Behavior Events
+
+`POST /api/v1/behavior/driver/{driverId}/process-events`
+
+Triggers immediate processing of all unprocessed behavior events for a driver. Normally this runs on a scheduled batch, but this endpoint allows manual triggering for compliance or testing purposes.
+
+==== Calculate Behavior Score
+
+`POST /api/v1/behavior/driver/{driverId}/calculate?periodStart={date}&periodEnd={date}`
+
+Calculates the behavioral score for a driver over a specific period. The score incorporates acceptance rate, cancellation rate, completion rate, on-time rate, and telemetry safety events.
+
+==== Get Current Behavior Score
+
+`GET /api/v1/behavior/driver/{driverId}/current-score`
+
+Returns the driver's live behavioral score for the current scoring period with all component metrics.
+
+.Score fields
+[cols="1,3", options="header"]
+|===
+| Field | Description
+| `overallScore` | Composite behavioral score (0–100)
+| `acceptanceRate` | Percentage of assigned trips accepted
+| `cancellationRate` | Percentage of accepted trips cancelled
+| `completionRate` | Percentage of started trips completed
+| `onTimeRate` | Percentage of pickups within target arrival time
+| `responseTimeAvg` | Average seconds to acknowledge a trip assignment
+| `safetyViolations` | Total safety incidents in the period
+| `speedingIncidents` | Number of speeding events detected
+| `harshBrakingIncidents` | Number of harsh braking events detected
+|===
+
+==== Get Behavior History
+
+`GET /api/v1/behavior/driver/{driverId}/history`
+
+Full history of all behavioral score records for a driver across all scoring periods. Used to identify long-term conduct trends.
+
+==== Get Behavior Trend
+
+`GET /api/v1/behavior/driver/{driverId}/trend?months={n}`
+
+Trend analysis comparing the current period score against the previous period. Returns `IMPROVING`, `DECLINING`, or `STABLE` with the score delta.
+
+==== Get Behavior Analytics
+
+`GET /api/v1/behavior/driver/{driverId}/analytics`
+
+Comprehensive behavioral analytics: overall score, all component rates, trip totals, safety violations, and performance tier classification.
+
+==== Get Safety Report
+
+`GET /api/v1/behavior/driver/{driverId}/safety-report?days={n}`
+
+Safety-focused report for the last N days: total safety events by severity, safety score, risk level classification, penalty points accumulated, and recommended remediation actions.
+
+==== Get Safety Alerts
+
+`GET /api/v1/behavior/driver/{driverId}/safety-alerts`
+
+Returns all active (unresolved) safety alerts for a driver. Alerts are generated automatically when critical or high-severity events occur during a trip.
+
+==== Analyze Trip Safety
+
+`GET /api/v1/behavior/trip/{tripId}/safety-analysis`
+
+Post-trip safety analysis for a single trip: total events, severity breakdown, safety score for the journey, and a list of specific issues detected.
+
+==== Check Premium Qualification
+
+`GET /api/v1/behavior/driver/{driverId}/premium-qualification`
+
+Returns a boolean indicating whether the driver currently meets the behavioral threshold for premium vehicle types.
+
+==== Get Performance Leaderboard
+
+`GET /api/v1/behavior/leaderboard`
+
+Paginated leaderboard of all drivers ranked by their overall behavioral score. Used for driver recognition and operator incentive programmes.
+
+==== Get Reliable Drivers
+
+`GET /api/v1/behavior/reliable-drivers?minCompletion={pct}&maxCancellation={pct}`
+
+Returns drivers with high trip completion rates and low cancellation rates. Default thresholds: 95% completion, 5% cancellation. Used for premium and corporate trip assignment pools.
+
+==== Get Drivers with Safety Violations
+
+`GET /api/v1/behavior/safety-issues`
+
+Returns all drivers with one or more active safety violations. Used by the compliance team for daily safety monitoring.
+
+==== Get High Cancellation Drivers
+
+`GET /api/v1/behavior/high-cancellation?threshold={pct}`
+
+Returns drivers whose cancellation rate exceeds the threshold (default 15%). High cancellation rates degrade the passenger experience and trigger compliance review.
+
+==== Get Low Completion Drivers
+
+`GET /api/v1/behavior/low-completion?threshold={pct}`
+
+Returns drivers with trip completion rates below the threshold (default 85%).
+
+==== Get Problematic Drivers Report
+
+`GET /api/v1/behavior/problematic-report`
+
+Consolidated report grouping problematic drivers by issue type: high cancellation, low completion, safety violations, and overall low performance. Used for weekly compliance reporting to operator management.
+
+==== Compare Driver Performance
+
+`GET /api/v1/behavior/compare?driverId1={id}&driverId2={id}`
+
+Side-by-side performance comparison of two drivers across all behavioral dimensions.
+
+<<<
+
+=== Driver Event Management Endpoints
+
+The event system records significant incidents and milestones in a driver's history — both negative (violations, complaints) and positive (awards, compliments). Events feed into the risk assessment and compliance workflow.
+
+==== Event Types
+
+*Violations:* `ACCIDENT`, `TRAFFIC_VIOLATION`, `CUSTOMER_COMPLAINT`, `LATE_PICKUP`, `TRIP_CANCELLATION`, `UNSAFE_DRIVING`, `SPEEDING`, `HARSH_BRAKING`, `HARSH_ACCELERATION`, `VERBAL_ABUSE`, `POLICY_VIOLATION`, `FRAUD_ATTEMPT`, `VEHICLE_DAMAGE`, `MISSED_INSPECTION`, `LICENSE_EXPIRED`, `INSURANCE_LAPSED`, `BREAK_MAX_TIME_VIOLATED`
+
+*Positive milestones:* `EXCELLENT_SERVICE`, `MILESTONE_ACHIEVED`, `AWARD_RECEIVED`, `PERFECT_WEEK`, `TOP_RATED`, `CUSTOMER_COMPLIMENT`, `TRAINING_COMPLETED`, `VEHICLE_INSPECTION_PASSED`
+
+*Account events:* `ACCOUNT_SUSPENDED`, `ACCOUNT_REACTIVATED`, `BACKGROUND_CHECK_FAILED`
+
+==== Record an Event
+
+`POST /api/v1/events`
+
+Records a new event against a driver's record. Events can be raised by passengers, administrators, the system, police, or third parties.
+
+.Request fields
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Description
+| `driverId` | integer | The driver this event concerns
+| `tripId` | integer | The trip during which the event occurred (if applicable)
+| `eventType` | enum | The classification of the event
+| `severity` | enum | `LOW`, `MEDIUM`, `HIGH`, or `CRITICAL`
+| `title` | string | Short descriptive title
+| `description` | string | Full narrative of what occurred
+| `eventDate` | datetime | When the event happened
+| `reportedBy` | integer | ID of the reporting party
+| `reportedByType` | enum | `PASSENGER`, `ADMIN`, `SYSTEM`, `DRIVER`, `POLICE`, `THIRD_PARTY`
+| `location` | string | Location description where the event occurred
+| `penaltyPoints` | integer | Points deducted from the driver's record
+| `fineAmount` | number | Monetary fine applied (if any)
+|===
+
+==== Resolve an Event
+
+`POST /api/v1/events/{eventId}/resolve`
+
+Closes an open event after investigation is complete. Resolution notes and the resolving administrator's ID are recorded for the audit trail.
+
+==== Get Open Events
+
+`GET /api/v1/events/open`
+
+Returns all events that have not yet been resolved. Used by the compliance team for their daily case management queue.
+
+==== Get Driver Safety Report
+
+`GET /api/v1/events/driver/{driverId}/safety-report?days={n}`
+
+Aggregated safety report based on recorded events for the last N days.
+
+==== Get Driver Risk Assessment
+
+`GET /api/v1/events/driver/{driverId}/risk-assessment`
+
+Comprehensive risk profile for a driver: overall risk score, risk level classification (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), violation count, penalty points, and the specific risk factors contributing to the assessment.
+
+<<<
+
+=== Driver Authentication Endpoints
+
+==== Login
+
+`POST /api/v1/drivers/auth/login`
+
+Authenticates a driver with their credentials and returns JWT access and refresh tokens.
+
+[source,json]
+----
+{
+  "username": "driver@example.com",
+  "password": "securepassword"
+}
+----
+
+Returns an access token (short-lived) and a refresh token (long-lived) along with expiry durations.
+
+==== Refresh Token
+
+`POST /api/v1/drivers/auth/refresh`
+
+Exchanges a valid refresh token for a new access token without requiring the driver to re-enter credentials.
+
+==== Logout
+
+`POST /api/v1/drivers/auth/logout`
+
+Revokes the driver's refresh token. The access token remains valid until its natural expiry.
+
+==== Get Driver Profile (JWT)
+
+`GET /api/v1/drivers/auth/user-info`
+
+Returns the Keycloak identity claims for the currently authenticated driver: subject ID, email, name, and verification status.
+
+==== Get Own Profile
+
+`GET /api/v1/drivers/profile`
+
+Returns the full profile for the driver associated with the current JWT. Used by the driver app to populate profile screens without exposing the driver ID in the URL.
+
+<<<
+
+=== Compliance Management Endpoints
+
+==== Get Expiring Licences
+
+`GET /api/v1/drivers/compliance/expiring-licenses?daysThreshold={days}`
+
+Returns drivers whose driving licences will expire within the specified number of days (default 30). Fleet managers use this to proactively contact drivers before their licence lapses and they are automatically deactivated.
+
+==== Get Expired Licences
+
+`GET /api/v1/drivers/compliance/expired-licenses`
+
+Returns all drivers whose licence has already expired. These drivers are flagged for immediate deactivation.
+
+==== Auto-Deactivate Expired Licences
+
+`POST /api/v1/drivers/compliance/deactivate-expired`
+
+System maintenance endpoint that automatically deactivates all drivers with expired licences. Returns the count of drivers deactivated. Designed to run as a scheduled job.
+
+<<<
+
+== Telemetry API
+
+*Base URL:* `http://localhost:10002`
+
+The Telemetry Service is the real-time geospatial backbone of the Tanzim dispatch platform. Its primary responsibilities are: ingesting a continuous stream of GPS position updates from thousands of simultaneously active driver devices; maintaining a low-latency geospatial index that the dispatch engine queries to find the nearest eligible driver when a passenger books a trip; and serving live driver positions to passenger apps so riders can watch their driver's icon move toward the pickup point in real time.
+
+Unlike the other services — which are backed by relational databases and optimised for durable, query-rich data — the Telemetry Service is deliberately designed around an in-memory Redis geospatial store. Driver positions are treated as ephemeral streaming data, not records. Every update overwrites the previous position for that driver. The geospatial index is rebuilt from live pings, not from persisted history. This architecture allows the service to sustain write throughput far beyond what a relational database could handle at GPS ping frequency across a large active fleet.
+
+The service exposes two categories of endpoints: **ingestion endpoints** (high-frequency writes from the driver app) and **query endpoints** (reads by the dispatch engine, passenger app, and operations dashboard). These two categories have very different traffic patterns and the API is designed accordingly — the simple coordinate ping endpoint (`/update/simple`) is as lightweight as possible to minimise the cost of thousands of concurrent writes per second.
+
+=== Location Data Architecture
+
+[source]
+----
+Driver App (every 4-10s)
+    │
+    ▼ POST /locations/update/simple  (coordinates only — high frequency)
+    │ POST /locations/update         (full state — on state changes)
+    │
+    ▼
+Redis Geospatial Index
+    │
+    ├──▶ Dispatch Engine  (GET /locations/nearest)       → trip assignment
+    ├──▶ Passenger App    (GET /locations/nearby/available) → live map
+    └──▶ Ops Dashboard    (GET /locations/available/count)  → fleet monitoring
+----
+
+=== Location Update Strategy
+
+The service provides two update paths because driver apps need to send GPS pings very frequently but do not change their full state on every ping. Sending a full state payload at GPS frequency would waste bandwidth and increase processing load unnecessarily.
+
+[cols="1,1,3", options="header"]
+|===
+| Endpoint | When to call | What it updates
+| `POST /locations/update/simple` | Every 4–10 seconds while active | Coordinates only — the geospatial index position
+| `POST /locations/update` | When state changes (availability, trip start/end, going online/offline) | Full location record including availability, trip ID, vehicle ID, bearing, speed, battery level
+|===
+
+NOTE: Calling `/update` at GPS-ping frequency is not recommended. The simple endpoint exists precisely to avoid this. A full update on every ping would saturate the service and degrade performance for all consumers of the geospatial index.
+
+=== Business Rules
+
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Coordinate bounds | Latitude must be between -90.0 and 90.0. Longitude must be between -180.0 and 180.0. Requests outside these bounds are rejected with `400`
+| Driver identity enforcement | Location update endpoints validate that the `driverId` in the request matches the authenticated driver's JWT. A driver cannot submit location data for a different driver. Admin tokens bypass this check
+| Bearing range | Bearing values must be between 0.0 and 360.0 degrees. Values outside this range are rejected
+| Battery level range | Battery level must be an integer between 0 and 100. Values outside this range are rejected
+| Geospatial search radius cap | The nearby search endpoints enforce a maximum search radius of 50 km. Requests with `radiusKm` above 50 are clamped to 50 km rather than rejected, to prevent overly broad searches from degrading index performance
+| Stale data handling | There is no automatic TTL on driver locations. A driver who goes offline without calling the remove endpoint will remain in the index with a stale `lastUpdated` timestamp. The dispatch engine uses the `lastUpdated` field to filter out drivers whose last ping was more than a configurable threshold ago (default: 5 minutes)
+|===
+
+=== Location Management Endpoints
+
+==== Update Driver Location (Full)
+
+`POST /api/v1/locations/update`
+
+Full location update including speed, bearing, accuracy, availability, and current trip context. Call this when the driver's state changes meaningfully — going online, accepting a trip, becoming unavailable, changing vehicle. Also use this as a periodic heartbeat every 20–60 seconds to ensure the dispatch engine's view of the driver's state stays fresh even if no state changes have occurred.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Coordinate validation | Latitude and longitude are mandatory and must be within valid geographic bounds. Bearing must be 0–360 if supplied. Speed must be non-negative
+| Driver identity | `driverId` in the request body must match the driver in the JWT. Mismatches return `403`
+| Availability flag | If `isAvailable` is `false`, the driver is removed from the available pool in the geospatial index and will not appear in dispatch searches until availability is set back to `true`
+| Trip linkage | When `currentTripId` is supplied, the update is associated with that trip's route recording. Route coordinates submitted while `currentTripId` is set are used for post-trip fare calculation
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Invalid or out-of-bounds coordinates | Check latitude (-90–90) and longitude (-180–180) values
+| 400 | Bearing outside 0–360 range | Supply a valid compass bearing
+| 403 | `driverId` does not match authenticated driver | Use the driver's own token; do not share tokens between devices
+| 404 | Driver not found in the system | Verify the driver ID exists in the Driver Service
+| 503 | Redis geospatial store unavailable | Retry with exponential backoff; the driver app should queue updates locally
+|===
+
+==== Simple Location Update (High Frequency)
+
+`POST /api/v1/locations/update/simple?driverId={id}&latitude={lat}&longitude={lon}`
+
+The most frequently called endpoint in the entire platform. No request body — all data is in query parameters. This intentional design minimises HTTP overhead for a call that may be made every 4–10 seconds per active driver.
+
+This endpoint *only* updates the driver's position in the geospatial index. It does not update availability, speed, bearing, battery level, or trip assignment. Those fields retain whatever values were last set by a full `/update` call.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Invalid coordinates | Check latitude and longitude bounds
+| 204 | Success — no body returned | This is the expected success response; do not treat the absence of a body as an error
+| 503 | Redis unavailable | Queue updates locally and replay when service recovers
+|===
+
+==== Update Driver Availability
+
+`PUT /api/v1/locations/driver/{driverId}/availability?isAvailable={bool}`
+
+Sets the driver's availability flag in the telemetry index without requiring a full location payload. The availability flag controls whether the driver appears in dispatch search results. Setting `isAvailable=false` immediately removes the driver from all nearest-driver and nearby-available queries.
+
+Use this for instantaneous state toggles: when a driver accepts or completes a trip, the Trip Service calls this endpoint to flip availability before the next dispatch cycle runs.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | `isAvailable` parameter missing or not a boolean | Supply `true` or `false`
+| 404 | Driver not currently tracked (no location record exists) | Driver must submit at least one location update before availability can be set
+| 403 | Caller does not have permission to update this driver's availability | Use the driver's own token or an admin token
+|===
+
+==== Get Driver Location
+
+`GET /api/v1/locations/driver/{driverId}`
+
+Returns the last known full location record for a driver — their coordinates, availability, current trip, speed, bearing, battery level, and the timestamp of the last update. This is the definitive source for any consumer that needs to know where a specific driver is right now.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 404 | Driver has no location record in the index | The driver has not submitted any location updates — they may be offline or their device has not yet pinged
+|===
+
+==== Remove Driver from Tracking
+
+`DELETE /api/v1/locations/driver/{driverId}`
+
+Removes the driver's entry from the geospatial index entirely. After this call the driver will return 404 from the Get Location endpoint and will not appear in any nearby or nearest searches. This is the correct endpoint to call when a driver ends their shift and goes offline — it keeps the index clean and prevents stale entries from being returned in dispatch queries.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 204 | Successfully removed — no body | This is the expected success response
+| 404 | Driver was not in the tracking index | No action needed — idempotent removal
+|===
+
+==== Batch Update Driver Locations
+
+`POST /api/v1/locations/batch-update`
+
+Updates multiple driver locations in a single API call. Used by fleet management systems and operator backend integrations that aggregate GPS data from their own tracking devices before forwarding to Tanzim.
+
+==== Get Multiple Driver Locations
+
+`POST /api/v1/locations/drivers/batch`
+
+Retrieves current location data for a list of driver IDs in one request. More efficient than individual calls when the passenger app or dispatch engine needs to refresh several drivers' positions simultaneously.
+
+==== Batch Remove Driver Locations
+
+`DELETE /api/v1/locations/batch-remove`
+
+Removes multiple drivers from tracking in a single call. Used during shift-end batch processing to clean up the tracking index.
+
+=== Geospatial Search Endpoints
+
+==== Find Nearest Driver
+
+`GET /api/v1/locations/nearest?latitude={lat}&longitude={lon}`
+
+Returns the single nearest available driver to the given coordinates. The primary query used by the dispatch engine when assigning a trip to a driver.
+
+.Response — `NearbyDriver`
+[cols="1,3", options="header"]
+|===
+| Field | Description
+| `driverId` | Driver identifier
+| `distanceKm` | Straight-line distance to the search point in kilometres
+| `distanceMeters` | Distance in metres
+| `estimatedTimeMinutes` | Estimated driving time to reach the search point
+| `bearing` | Driver's current heading in degrees
+| `speed` | Current speed in km/h
+| `rating` | Driver's average rating (sourced from Driver Service)
+| `totalTrips` | Total completed trips (used for experience weighting)
+| `isAvailable` | Confirms real-time availability at query time
+| `lastUpdated` | Timestamp of the most recent location ping
+|===
+
+==== Find Nearby Available Drivers
+
+`GET /api/v1/locations/nearby/available`
+
+Returns all available drivers within a radius, with an optional result limit. Used to display the driver map on the passenger app's booking screen.
+
+.Query parameters
+[cols="1,1,1,3", options="header"]
+|===
+| Parameter | Type | Default | Description
+| `latitude` | number | — | Search centre latitude
+| `longitude` | number | — | Search centre longitude
+| `radiusKm` | number | 3.0 | Search radius in kilometres
+| `limit` | integer | all | Cap on results returned
+|===
+
+==== Find All Nearby Drivers
+
+`GET /api/v1/locations/nearby`
+
+Returns all drivers (available and on-trip) within a radius up to 50 km. Used for fleet monitoring and operations dashboards.
+
+==== Calculate Distance Between Two Drivers
+
+`GET /api/v1/locations/distance?driverId1={id}&driverId2={id}`
+
+Calculates the current straight-line distance and estimated travel time between two tracked drivers. Used for multi-vehicle coordination and convoy dispatch scenarios.
+
+=== Fleet Monitoring Endpoints
+
+==== Get All Available Driver IDs
+
+`GET /api/v1/locations/available/ids`
+
+Returns the list of IDs for all drivers currently marked available in the tracking index. Used by the dispatch engine to filter the candidate pool before geospatial ranking.
+
+==== Count Available Drivers
+
+`GET /api/v1/locations/available/count`
+
+Returns the total count of tracked available drivers and the total number of drivers currently in the tracking index. Used for fleet availability dashboards and demand-supply monitoring.
+
+==== Health Check
+
+`GET /api/v1/locations/health`
+
+Returns service health status including the current count of tracked available drivers. Used by infrastructure monitoring and load balancer health probes.
+
+<<<
+
+== Pricing API
+
+*Base URL:* `http://localhost:10003`
+
+The Pricing Service is the financial calculation engine of the Tanzim platform. It is responsible for two distinct but related tasks: generating the **fare estimate** shown to a passenger before they book, and computing the **actual fare** charged at trip completion. These are not the same calculation — the estimate is a projection based on the planned route, while the actual fare is computed from the GPS coordinates the driver submitted during the trip.
+
+The pricing model is deliberately layered. A base rate applies to every trip, but multiple overlapping factors can modify it. A trip that departs from an airport special zone, travels through a toll gate, and is booked during the morning peak hour will have contributions from zone pricing, toll charges, and time-window pricing all applied simultaneously. The `pricingFactors` array in every estimate response makes this composition fully transparent — every factor that affected the fare is listed with its value and impact.
+
+This transparency is important for passenger trust and for dispute resolution. When a passenger questions their fare, the support team can retrieve the estimate response and point to exactly which factors were applied and why.
+
+The service also manages the configuration objects that define those factors: pricing zones (geofenced areas with rate overrides), toll gates (physical infrastructure with time-based charges), and time windows (scheduling rules that define peak, off-peak, and late-night rate periods). Each of these configuration types has its own CRUD API and can be toggled on/off independently without disrupting other pricing rules.
+
+=== Fare Calculation Formula
+
+[source]
+----
+Step 1 — Base components:
+    subtotal = onboardingFare
+             + (distanceKm × perKmRate)
+             + (durationMinutes × perMinuteRate)
+
+Step 2 — Add fixed charges:
+    subtotal = subtotal + tollCharges + bookingFee + serviceTax
+
+Step 3 — Apply minimum fare floor:
+    subtotal = max(subtotal, minimumFare)
+
+Step 4 — Apply surge multiplier:
+    totalFare = subtotal × surgeMultiplier
+
+----
+
+The `perKmRate`, `onboardingFare`, and `perMinuteRate` used in Step 1 are sourced from whichever pricing configuration takes priority: zone pricing overrides time-window pricing, which overrides the base rate. The highest-priority matching configuration wins.
+
+=== Pricing Priority Order
+
+[cols="1,1,3", options="header"]
+|===
+| Priority | Source | Description
+| 1 (Highest) | Zone pricing rule | Rate defined for a specific zone and vehicle type combination. Applied when the pickup or destination falls within an active special pricing zone
+| 2 | Time window pricing | Rate defined for a time window (e.g. PEAK) and vehicle type. Applied when the booking time falls within an active window
+| 3 (Lowest) | Base rate | The fallback rate if no zone or time window applies
+|===
+
+=== Pricing Zones
+
+Zones are polygon-defined geographic areas that override the base per-km and onboarding fare rates within their boundaries. When the pickup point or destination of a trip falls within a zone, that zone's rates are applied instead of the default time-window or base rates. If both pickup and destination are in different zones, the zone with the higher priority value wins.
+
+Zones are stored as closed polygons — the coordinate array must define at least 3 vertices. The platform automatically closes the polygon (connecting the last vertex back to the first) if the final coordinate is not identical to the first.
+
+==== Zone Types
+
+[cols="1,3", options="header"]
+|===
+| Type | Description
+| `SPECIAL_PRICING` | Areas with permanently adjusted fares regardless of time of day. Used for tourist districts, corporate parks, gated communities, and other locations where service demand or operating costs justify a different rate structure
+| `TOLL_GATE` | Zones that are managed alongside toll gate infrastructure. Setting a zone as `TOLL_GATE` type links it to toll gate records for coordinated activation and deactivation
+| `SURGE_ZONE` | Geographic areas where demand-supply imbalance triggers automatic fare multipliers. Surge zones are evaluated in real time — the system monitors driver availability relative to request volume within the zone boundary
+| `RESTRICTED` | Areas where Tanzim service is prohibited or subject to special operator agreements. Trips with origins or destinations inside a `RESTRICTED` zone are blocked at the booking stage
+|===
+
+==== Zone Pricing Rule Fields
+
+When adding a pricing rule to a zone, the following fields apply:
+
+[cols="1,1,1,3", options="header"]
+|===
+| Field | Type | Required | Description
+| `zoneId` | integer | Yes | The zone this rule applies to
+| `vehicleType` | enum | Yes | Which vehicle category this rate applies to. Each vehicle type requires its own rule within the same zone — there is no wildcard
+| `onboardingFare` | number | Yes | Fixed boarding charge within this zone, replacing the default onboarding fare. Must be ≥ 0
+| `perKmRate` | number | Yes | Per-kilometre rate within this zone. Must be ≥ 0. Applied to the full trip distance if the pickup is in the zone
+| `active` | boolean | No | Whether this rule is currently enforced. Defaults to `true`
+| `priority` | integer | No | Resolution order when multiple zone rules could apply. Higher number = higher priority. Defaults to 0
+|===
+
+==== Zone Business Rules
+
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Polygon minimum | A zone polygon must have at least 3 coordinate pairs. Fewer than 3 points cannot form a closed area and are rejected with `400`
+| Vehicle-type specificity | Each pricing rule within a zone is bound to a single vehicle type. To cover all vehicle types, a separate rule must be created for each. There is no "apply to all types" shorthand
+| Zone overlap | Overlapping zones are permitted. When a trip falls in multiple zones simultaneously, the zone rule with the highest `priority` value is applied. Ties are broken by zone ID (lower ID wins)
+| Restricted zone enforcement | If a trip's source or destination falls inside a `RESTRICTED` zone, the booking request is rejected by the Trip Service with a `400` error. The client should surface a message to the passenger explaining that service is unavailable at that location
+|===
+
+.Error scenarios for zone operations
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Fewer than 3 coordinate pairs in the polygon | Add more coordinate pairs to form a valid polygon
+| 400 | Coordinate out of bounds (lat > 90 or lon > 180, etc.) | Correct the coordinate values
+| 404 | Zone ID not found | Verify the zone ID exists
+| 404 | Vehicle type rule not found for zone | Create a zone pricing rule for that vehicle type first
+|===
+
+==== Create Pricing Zone
+
+`POST /api/v1/pricing/zones`
+
+Defines a new geofenced pricing zone using a polygon coordinate array (minimum 3 points to close the polygon).
+
+[source,json]
+----
+{
+  "name": "Dubai International Airport Zone",
+  "zoneType": "SPECIAL_PRICING",
+  "description": "Premium pickup and drop-off rates apply within DXB airport boundaries",
+  "coordinates": [
+    { "latitude": 25.2532, "longitude": 55.3657 },
+    { "latitude": 25.2532, "longitude": 55.4100 },
+    { "latitude": 25.2100, "longitude": 55.4100 },
+    { "latitude": 25.2100, "longitude": 55.3657 }
+  ],
+  "active": true
+}
+----
+
+==== Get All Pricing Zones
+
+`GET /api/v1/pricing/zones`
+
+Returns all zones, optionally filtered by type and/or active status.
+
+==== Get Zones by Type
+
+`GET /api/v1/pricing/zones/by-type/{zoneType}`
+
+Returns all zones of a specific classification.
+
+==== Toggle Zone Active Status
+
+`PATCH /api/v1/pricing/zones/{zoneId}/toggle?active={bool}`
+
+Activates or deactivates a zone. Deactivated zones are ignored during fare calculation but their configuration is preserved for reactivation.
+
+==== Add Pricing Rule to Zone
+
+`POST /api/v1/pricing/zones/{zoneId}/pricing`
+
+Attaches a vehicle-type-specific pricing rule to a zone. Each vehicle type can have its own rate within the same zone.
+
+[source,json]
+----
+{
+  "zoneId": 5,
+  "vehicleType": "AIRPORT",
+  "onboardingFare": 15.00,
+  "perKmRate": 3.50,
+  "active": true,
+  "priority": 10
+}
+----
+
+==== Check Point in Zone
+
+`POST /api/v1/pricing/zones/check-point`
+
+Determines whether a given coordinate falls within any active pricing zone. Used by the pre-trip pricing engine to detect which zones apply to the pickup and destination points.
+
+==== Bulk Import Zones
+
+`POST /api/v1/pricing/zones/bulk-import`
+
+Imports multiple pricing zones in a single request. Used for initial fleet setup and when rolling out pricing changes across a new city or district.
+
+=== Toll Gates
+
+Toll gates represent physical road toll collection points on routes within the Tanzim operating area. When the platform calculates a fare estimate, it traces the planned route and checks each toll gate's polygon to determine whether the route passes through any managed toll infrastructure. Every toll gate detected on the route contributes its charge — based on vehicle type and time of day — to the `tollCharges` component of the fare.
+
+Toll gate polygons are typically narrow rectangles positioned perpendicular to the road at the toll point, sized to capture the road footprint while excluding adjacent areas. Each toll gate has a unique `code` (e.g. `SZR-TG-03`) used for integration with external toll management systems.
+
+==== Toll Gate Pricing Rule Fields
+
+[cols="1,1,1,3", options="header"]
+|===
+| Field | Type | Required | Description
+| `tollGateId` | integer | Yes | The toll gate this rule applies to
+| `vehicleType` | enum | Yes | Which vehicle category this charge applies to
+| `tollCharge` | number | Yes | The charge amount in the operating currency. Must be ≥ 0
+| `startTime` | LocalTime | No | Start of the time window during which this charge applies. If not supplied, the charge applies at all times
+| `endTime` | LocalTime | No | End of the time window. Must be after `startTime` if both are supplied
+| `daysOfWeek` | array of integers | No | Days this rule is active (1=Monday through 7=Sunday). If not supplied, the rule applies every day
+| `active` | boolean | No | Whether this pricing rule is currently enforced. Defaults to `true`
+| `description` | string | No | Human-readable notes about this pricing rule (e.g. "Peak weekday rate", "Weekend flat rate")
+|===
+
+==== Toll Gate Business Rules
+
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Multiple rules per gate | A single toll gate can have multiple pricing rules for different vehicle types and/or time periods. The platform selects the first active matching rule at the time of booking. If no rule matches the vehicle type and time, no toll charge is applied for that gate
+| Route detection | Toll gate detection is performed by checking whether any segment of the estimated route intersects the toll gate's polygon. A route that bypasses the toll gate's physical location will not incur its charge
+| Pre-trip vs actual | Toll charges in the fare estimate are based on the planned route. The actual fare (computed at trip completion from the GPS path) may include different toll gates if the driver took a different route
+| Zero-charge gates | A toll gate with `tollCharge: 0` is valid and can be used to document infrastructure that does not charge (e.g. a monitored checkpoint)
+|===
+
+.Error scenarios for toll gate operations
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | `tollCharge` is negative | Toll charges must be zero or positive
+| 400 | `endTime` is before `startTime` | Time window end must follow start
+| 400 | Polygon has fewer than 3 coordinate pairs | Add more vertices to form a valid polygon
+| 404 | Toll gate ID not found | Verify the toll gate ID
+| 409 | A toll gate with the given `code` already exists | Codes must be unique; use a distinct code for each physical gate
+|===
+
+==== Create Toll Gate
+
+`POST /api/v1/pricing/toll-gates`
+
+Registers a new toll gate with a polygon boundary and unique code.
+
+[source,json]
+----
+{
+  "name": "Sheikh Zayed Road Toll Gate 3",
+  "code": "SZR-TG-03",
+  "description": "Inbound toll at Interchange 3, SZR",
+  "coordinates": [
+    { "latitude": 25.1812, "longitude": 55.2605 },
+    { "latitude": 25.1812, "longitude": 55.2650 },
+    { "latitude": 25.1780, "longitude": 55.2650 },
+    { "latitude": 25.1780, "longitude": 55.2605 }
+  ],
+  "active": true
+}
+----
+
+==== Add Toll Pricing Rule
+
+`POST /api/v1/pricing/toll-gates/{tollGateId}/pricing`
+
+Attaches a vehicle-type and time-based pricing rule to a toll gate. Toll charges can differ by vehicle type and time of day.
+
+[source,json]
+----
+{
+  "tollGateId": 12,
+  "vehicleType": "SEDAN",
+  "tollCharge": 4.00,
+  "startTime": { "hour": 6, "minute": 0, "second": 0, "nano": 0 },
+  "endTime": { "hour": 22, "minute": 0, "second": 0, "nano": 0 },
+  "daysOfWeek": [1, 2, 3, 4, 5],
+  "active": true,
+  "description": "Weekday daytime rate"
+}
+----
+
+==== Calculate Toll Charge
+
+`GET /api/v1/pricing/toll-gates/{tollGateId}/calculate?vehicleType={type}&time={datetime}`
+
+Calculates the applicable toll charge for a given vehicle type at a given time (defaults to now). Used during pre-trip estimation when the planned route passes through a known toll gate.
+
+==== Get Toll Gate by Code
+
+`GET /api/v1/pricing/toll-gates/by-code/{code}`
+
+Looks up a toll gate by its unique code. Used by the route-analysis engine to resolve toll gate references from mapping data.
+
+=== Time Windows
+
+Time windows define the pricing periods that apply across the operating day. They are the mechanism through which Tanzim implements peak-hour pricing, late-night incentive rates, and weekend flat rates. At the moment a fare estimate is generated, the platform looks up which time window (if any) is active for the given vehicle type at the requested departure time, and applies that window's rates in place of the default base rate.
+
+Each time window is specific to a single vehicle type — there is no cross-type shorthand. To configure peak pricing for both `SEDAN` and `SUV`, two separate time window records must be created. Windows can overlap on the clock (e.g. a `REGULAR` window from 09:00–18:00 and a `PEAK` window from 07:00–09:00) — the `priority` field determines which window wins when overlap occurs.
+
+==== Time Window Field Descriptions
+
+[cols="1,1,1,3", options="header"]
+|===
+| Field | Type | Required | Description
+| `name` | string | Yes | Human-readable label (e.g. "Morning Peak - Sedan", "Late Night SUV"). Used in fare breakdowns shown to passengers
+| `vehicleType` | enum | Yes | The vehicle category this window applies to
+| `windowType` | enum | Yes | Classification: `PEAK`, `OFF_PEAK`, `REGULAR`, `LATE_NIGHT`, or `WEEKEND`. Used for reporting and display only — does not affect pricing logic
+| `startTime` | LocalTime | Yes | When this pricing window begins (e.g. `{ "hour": 7, "minute": 0 }`)
+| `endTime` | LocalTime | Yes | When this pricing window ends. If `endTime` is before `startTime` (e.g. 23:00 to 02:00), the window is understood to span midnight
+| `daysOfWeek` | array of integers | No | Days this window is active. 1 = Monday, 7 = Sunday. If empty or not supplied, the window is active every day
+| `onboardingFare` | number | Yes | Fixed boarding charge applied during this window. Must be ≥ 0
+| `perKmRate` | number | Yes | Per-kilometre rate during this window. Must be ≥ 0
+| `perMinuteRate` | number | Yes | Per-minute rate during this window. Must be ≥ 0. Applied to estimated travel time in the pre-trip estimate and to actual trip duration in the post-trip fare
+| `minimumFare` | number | Yes | Floor fare — no trip booked in this window will be charged less than this amount, even if the calculated fare is lower. Must be ≥ 0
+| `active` | boolean | No | Whether this window is currently enforced. Defaults to `true`
+| `priority` | integer | No | Determines which window applies when multiple windows could match the same vehicle type and time. Higher number = higher priority. Defaults to 0
+|===
+
+==== Time Window Business Rules
+
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| One active window per query | The `GET /time-windows/active` endpoint returns at most one window per vehicle type at a given time. If multiple active windows match, the one with the highest `priority` is returned
+| Midnight-spanning windows | Windows where `endTime` is earlier on the clock than `startTime` are treated as spanning midnight (e.g. 22:00–02:00 covers the late-night period into the next calendar day)
+| Gap between windows | If no active window matches the booking time and vehicle type, the base rate is used. It is valid to leave time gaps — not every minute of the day needs a window configured
+| Priority ties | If two windows have the same priority and both match the same vehicle type and time, the window with the lower database ID is selected. Configure distinct priority values to avoid ambiguity
+|===
+
+.Error scenarios for time window operations
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | `onboardingFare`, `perKmRate`, `perMinuteRate`, or `minimumFare` is negative | All fare amounts must be zero or positive
+| 400 | `startTime` and `endTime` are identical | A window must span at least one minute
+| 400 | Missing required time or rate fields | Ensure all required fields are present
+| 404 | Time window ID not found | Verify the window ID
+|===
+
+==== Create Time Window
+
+`POST /api/v1/pricing/time-windows`
+
+Defines a new pricing window with the applicable rates.
+
+[source,json]
+----
+{
+  "name": "Morning Peak - Sedan",
+  "vehicleType": "SEDAN",
+  "windowType": "PEAK",
+  "startTime": { "hour": 7, "minute": 0, "second": 0, "nano": 0 },
+  "endTime":   { "hour": 9, "minute": 30, "second": 0, "nano": 0 },
+  "daysOfWeek": [1, 2, 3, 4, 5],
+  "onboardingFare": 5.00,
+  "perKmRate": 2.80,
+  "perMinuteRate": 0.35,
+  "minimumFare": 12.00,
+  "active": true,
+  "priority": 20
+}
+----
+
+==== Get Active Time Window
+
+`GET /api/v1/pricing/time-windows/active?vehicleType={type}&time={datetime}`
+
+Returns whichever time window is currently active for the given vehicle type at the given moment (defaults to now). The pricing engine calls this at every trip estimate to select the correct rate set.
+
+=== Fare Estimation Endpoints
+
+==== Calculate Price Estimate
+
+`POST /api/v1/pricing/estimate`
+
+The primary pre-trip fare estimation endpoint. Given a pickup point, destination, and vehicle type, the engine executes the full pricing pipeline:
+
+1. Queries the mapping integration to calculate route distance (km) and estimated travel time (minutes) for the given coordinates
+2. Checks the pickup and destination points against all active pricing zones to identify any zone-based rate overrides
+3. Determines which time window (if any) is active for this vehicle type at the current time
+4. Traces the planned route against all active toll gate polygons to identify any gates on the path
+5. Applies zone or time-window rate overrides — zone pricing takes precedence over time-window pricing
+6. Computes the fare components: onboarding fare, distance fare, time fare, toll charges, booking fee, and service tax
+7. Applies the minimum fare floor
+8. Applies any active surge multiplier for the pickup zone
+9. Returns the total fare, a min/max fare range, and a full breakdown of every applied factor
+
+The returned `estimateId` should be stored by the client and passed when creating a trip booking. The Trip Service uses this ID to record which estimate the passenger was shown at booking time. Estimates expire — typically after 10 minutes — and a new estimate must be generated if booking is delayed.
+
+.Business rules
+[cols="1,3", options="header"]
+|===
+| Rule | Detail
+| Estimate expiry | Estimates are valid for a configurable window (default 10 minutes). After expiry the estimate is retained in the database but `isPriceEstimateValid` returns `false`. Expired estimates should not be used for trip booking — generate a fresh one
+| Fare range | The response includes `estimatedFareMin` and `estimatedFareMax` representing a confidence interval around `totalFare`. The range widens in high-surge or ambiguous-route conditions
+| Surge transparency | If `surgeMultiplier > 1.0`, the `surgeReason` field always contains a human-readable explanation suitable for display to the passenger (e.g. "High demand near Dubai Mall")
+| Restricted zone blocking | If the pickup or destination falls inside a `RESTRICTED` pricing zone, the estimate request is rejected with `400`. The client should surface the restriction message to the passenger
+| Minimum fare | The `minimumFare` from the active time window or zone pricing rule acts as a floor. No estimate will return a `totalFare` below the applicable minimum
+|===
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 400 | Missing required coordinates or `vehicleType` | Supply all required fields
+| 400 | Pickup or destination is in a `RESTRICTED` zone | Inform the passenger that service is unavailable at this location
+| 400 | Coordinates out of geographic bounds | Verify latitude and longitude values
+| 503 | Mapping service unavailable — route distance cannot be calculated | Retry; the estimate cannot be generated without routing data
+| 503 | Pricing configuration not loaded — no base rates found | Contact platform support; rate configuration may be missing
+|===
+
+==== Quick Price Estimate
+
+`GET /api/v1/pricing/estimate/quick?sourceLat={}&sourceLon={}&destLat={}&destLon={}&vehicleType={}`
+
+Lightweight GET-based estimate for simple integrations and price-check widgets. Returns the same full estimate response without requiring a request body. Identical calculation pipeline to `POST /estimate` — use this when constructing a request body is impractical (e.g. a link-based price widget, a browser bookmarklet, or server-side rendering without a POST client).
+
+NOTE: Because all parameters are in the URL, this endpoint's requests appear in server logs. Do not use it for requests where the coordinates should remain private.
+
+==== Calculate Prices for All Vehicle Types
+
+`POST /api/v1/pricing/estimate/all`
+
+Executes the full pricing pipeline once per vehicle type and returns estimates for all supported types in a single response. Used by the booking screen to display the vehicle selection carousel with prices side-by-side. The response includes a `calculatedAt` timestamp so clients can display fare freshness to the passenger.
+
+NOTE: This endpoint invokes the full pricing engine for every vehicle type. It is more expensive than a single-type estimate — avoid calling it for non-UI purposes such as backend batch processing.
+
+==== Get Fare Breakdown (Pre-Trip)
+
+`POST /api/v1/pricing/estimate/fare-breakdown`
+
+Returns a detailed line-item breakdown for a route where the distance and travel time are already known. Use this when the client has already fetched the route from a mapping API and does not want the Pricing Service to recalculate routing. Supplying the route as a `lineString` (ordered coordinate array) allows the service to perform toll gate detection without re-routing.
+
+==== Get Actual Fare Breakdown (Post-Trip)
+
+`POST /api/v1/pricing/estimate/fare-breakdown-actual`
+
+Computes the definitive post-trip fare from the GPS coordinates the driver submitted during the trip. This is the amount that will be charged to the passenger. The `coordinates` parameter should be the same coordinate array passed to `POST /trips/{tripId}/complete`.
+
+The actual fare may differ from the pre-trip estimate for three reasons: the driver may have taken a longer or shorter route than the planned path; the actual trip duration may differ from the estimated duration; or the driver may have passed through different toll gates than were predicted on the planned route.
+
+==== Retrieve Saved Estimate
+
+`GET /api/v1/pricing/estimate/{estimateId}`
+
+Retrieves a previously generated estimate by its ID. The estimate is retained even after expiry — it will be returned with its original values but `isPriceEstimateValid` will return `false` for expired estimates. This allows support teams to reconstruct exactly what fare was shown to a passenger at booking time when investigating a dispute.
+
+.Error scenarios
+[cols="1,1,3", options="header"]
+|===
+| HTTP Status | Condition | Resolution
+| 404 | Estimate ID not found | Verify the estimate ID; IDs are generated at estimation time and cannot be constructed manually
+|===
+
+==== Check Estimate Validity
+
+`GET /api/v1/pricing/estimate/{estimateId}/valid`
+
+Returns a boolean. `true` means the estimate was generated within the validity window and its rates are still current. `false` means the estimate has expired and a new one should be generated before the passenger completes their booking.
+
+==== Calculate Distance and Time Only
+
+`POST /api/v1/pricing/distance-time`
+
+Queries the mapping integration for route distance and estimated travel time without applying any pricing logic. Returns distance in both kilometres and miles, and travel time as both a raw integer (minutes) and a human-readable display string (e.g. "23 mins"). Use this when the app needs routing data for display purposes without the overhead of a full fare calculation.
+
+=== Surge Pricing Endpoints
+
+==== Get Current Surge Multiplier
+
+`GET /api/v1/pricing/surge?vehicleType={type}`
+
+Returns the active surge multiplier for a vehicle type at the current moment. A multiplier of `1.0` means no surge — fares are at standard rates. Values above `1.0` indicate that demand in the area is outpacing driver supply and fares have been elevated to attract more drivers online and moderate demand.
+
+Surge conditions are evaluated in real time by comparing the count of available drivers in each pricing zone against the rate of incoming trip requests. The multiplier, the zone(s) driving the surge, and the reason string are all returned so the passenger-facing UI can display a meaningful explanation.
+
+.Response fields (`SurgePricingResponse`)
+[cols="1,3", options="header"]
+|===
+| Field | Description
+| `vehicleType` | The vehicle type the surge applies to
+| `surgeMultiplier` | Current multiplier (e.g. `1.5` = fares are 50% above standard)
+| `message` | Human-readable reason for display to the passenger (e.g. "High demand near your location. Prices are temporarily higher.")
+| `effectiveAt` | Timestamp when this surge level became active
+|===
+
+=== Operational Endpoints
+
+==== Get All Vehicle Types
+
+`GET /api/v1/pricing/vehicle-types`
+
+Returns the list of all vehicle types supported by the pricing engine. Used to populate vehicle selection UIs.
+
+==== Pricing Service Health Check
+
+`GET /api/v1/pricing/health`
+
+Returns a simple status string confirming the pricing service is operational. Used by load balancers and infrastructure monitoring.
+
+<<<
+
+[appendix]
+== Supported Vehicle Types Reference
+
+[cols="1,1,3,1", options="header"]
+|===
+| Code | Display Name | Use Case | Capacity
+| `ECONOMY` | Economy | Budget rides | 4
+| `SEDAN` | Sedan | Standard everyday rides | 4
+| `SUV` | SUV | Extra space, families | 6
+| `VAN` | Van | Group trips | 7–9
+| `LUXURY` | Luxury | Corporate, premium | 4
+| `ELECTRIC` | Electric | Eco-conscious rides | 4
+| `HYBRID` | Hybrid | Fuel-efficient option | 4
+| `WOMEN` | Women Only | Gender-exclusive service | 4
+| `AIRPORT` | Airport Transfer | Dedicated airport service | 4–6
+|===
+
+[appendix]
+== Trip Status Reference
+
+[cols="1,3", options="header"]
+|===
+| Status | Description
+| `REQUESTED` | Passenger submitted the booking
+| `PENDING` | Platform is searching for an available driver
+| `CONFIRMED` | Booking accepted by the system
+| `SCHEDULED` | Pre-booked trip queued for future dispatch
+| `PROCESSING` | Driver assignment in progress
+| `DRIVER_ASSIGNED` | A driver has been dispatched
+| `DRIVER_ARRIVED` | Driver has reached the pickup location
+| `IN_PROGRESS` | Passenger on board, trip underway
+| `PAYMENT_PENDING` | Trip complete, awaiting payment settlement
+| `COMPLETED` | Trip and payment both resolved
+| `CANCELLED` | Cancelled by passenger, driver, or platform
+| `FAILED` | Unrecoverable error during trip or payment
+| `EXPIRED` | Booking timed out before a driver was assigned
+|===
+
+[appendix]
+== Service Port Reference
+
+[cols="1,1,1", options="header"]
+|===
+| Service | Development Port | Base Path
+| Trip Service | 10005 | `/api/v1/trips`
+| Driver & Vehicle Service | 10001 | `/api/v1/drivers`, `/api/v1/shifts`, `/api/v1/vehicles`, `/api/v1/assignments`, `/api/v1/ratings`, `/api/v1/behavior`, `/api/v1/events`
+| Telemetry Service | 10002 | `/api/v1/locations`
+| Pricing Service | 10003 | `/api/v1/pricing`
+|===
+
+[appendix]
+== Contact & Support
+
+[cols="1,2", options="header"]
+|===
+| Channel | Details
+| Technical support | gov-relations@tanzim.io
+| Developer portal | https://tanzim.io
+| API licence | Apache 2.0 — https://www.apache.org/licenses/LICENSE-2.0.html
+|===
