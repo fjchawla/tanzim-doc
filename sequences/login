@@ -1,0 +1,28 @@
+@startuml
+' sequence for screen 3, 4, 5 and 6
+
+actor Driver
+participant "API Gateway"
+participant "Driver Service"
+participant "Keycloak"
+
+Driver -> "API Gateway": /auth/login
+"API Gateway" -> "Driver Service": /auth/login
+
+"Driver Service" -> "Keycloak": login
+"Keycloak" --> "Driver Service": oAuth token
+
+"Driver Service" --> "API Gateway": oAuth Token
+
+"API Gateway" --> Driver : oAuth token
+
+Driver -> "API Gateway": /assignments/driver/{{driver_id}}/current
+
+"API Gateway" -> "Driver Service" : /assignments/driver/{{driver_id}}/current
+
+"Driver Service" --> "API Gateway" : Assigned Vehicle
+
+"API Gateway" --> Driver: Assigned Vehicle 
+
+
+@enduml
