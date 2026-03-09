@@ -1,1 +1,33 @@
+@startuml
+' sequence for screen 6 (confirm and start shift) , 7 
 
+actor Driver
+participant "API Gateway"
+participant "Driver Service"
+participant "Telemetry Service"
+
+Driver -> "API Gateway": /{driverId}/location
+"API Gateway" -> "Driver Service": /{driverId}/location
+
+"Driver Service" -> "Telemetry Service": /{driverId}/location
+"Telemetry Service" --> "Driver Service": 200 OK
+
+"Driver Service" --> "API Gateway": 200 OK
+
+"API Gateway" --> Driver : 200 OK
+
+Driver -> "API Gateway": /api/v1/shifts/start
+
+"API Gateway" -> "Driver Service": /api/v1/shifts/start
+
+"Driver Service" -> "Driver Service": update Driver Availability
+
+"Driver Service" -> "Telemetry Service": update Availability
+
+"Telemetry Service" --> "Driver Service": 200 OK
+
+"Driver Service" --> "API Gateway": ShiftResponse
+
+"API Gateway" --> Driver: Shift Response
+
+@enduml
