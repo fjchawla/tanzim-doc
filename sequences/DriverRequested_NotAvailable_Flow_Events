@@ -1,0 +1,18 @@
+@startuml
+
+
+Rider -> TanzimPriceService : getTripEstimate()
+TanzimPriceService -> OSM : getDistanceAndTime()
+OSM -->TanzimPriceService : distance_time
+TanzimPriceService --> Rider : FareAndTimeEstimate
+Rider -> TanzimTripService : CreateimmediateTrip()
+TanzimTripService -> Kafka : TripRequestedEvent / trip-request
+TanzimDriverService -> Kafka : TripRequestedConsumer / trip-request
+TanzimDriverService_TripRequestedConsumer -> Driver : PushNotification(Driver_Assigned) 
+Driver -> TanzimDriverService : not_available
+TanzimDriverService -> Kafka : TripRequestedEvent / trip-request
+TanzimDriverService -> Kafka : TripRequestedConsumer / trip-request
+TanzimDriverService_TripRequestedConsumer -> Driver : PushNotification(Driver_Assigned) 
+Driver -> TanzimDriverService : not_available
+TanzimDriverService -> PushNotificationHandler : notifyPassengerDriverNotAvailable
+@enduml
