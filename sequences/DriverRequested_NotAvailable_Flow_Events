@@ -15,4 +15,5 @@ TanzimDriverService -> Kafka : TripRequestedConsumer / trip-request
 TanzimDriverService_TripRequestedConsumer -> Driver : PushNotification(Driver_Assigned) 
 Driver -> TanzimDriverService : not_available
 TanzimDriverService -> PushNotificationHandler : notifyPassengerDriverNotAvailable
+PushNotificationHandler -> Rider : passengerNotAvailable
 @enduml
